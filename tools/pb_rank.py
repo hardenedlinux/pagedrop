@@ -135,10 +135,15 @@ def parse_index(path):
             line = line.strip()
             if not line:
                 continue
+            # comm is the only field the program controls. pagedrop
+            # replaces whitespace in it, but an index from an older module
+            # may have a comm with spaces, so take it as whatever lies
+            # between the first field and the last three.
             parts = line.split()
-            if len(parts) != 5:
+            if len(parts) < 5:
                 raise SystemExit("%s:%d: expected 5 fields" % (path, lineno))
-            tgid_s, comm, va_s, epoch_s, why = parts
+            tgid_s, va_s, epoch_s, why = parts[0], parts[-3], parts[-2], parts[-1]
+            comm = " ".join(parts[1:-3])
             try:
                 tgid = int(tgid_s)
                 va = int(va_s, 16)

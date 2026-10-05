@@ -75,13 +75,13 @@ def main():
             "10 prog 4000 4 mprotect",
             "10 prog 4000 9 mprotect",
             "10 prog 5000 8 mmap",
-            "11 other 6000 7 fault",
+            "11 an other 6000 7 fault",
         ]
         write(index, ("\n".join(lines) + "\n").encode())
         code, out, err = run(["--index", index, "--dumps", dumps, "--file", binary, "--no-default-libs", "--lib", libc])
         if code != 2:
             raise SystemExit("expected exit 2, got %d %s" % (code, err))
-        if "tgid 10" not in err or "tgid 11" not in err:
+        if "tgid 10" not in err or "tgid 11 comm an other" not in err:
             raise SystemExit(err)
         code, out, err = run(["--index", index, "--dumps", dumps, "--file", binary, "--tgid", "10", "--no-default-libs", "--lib", libc])
         if code != 0:

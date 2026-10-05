@@ -59,6 +59,10 @@
 
 #include <uapi/asm-generic/mman-common.h>
 
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
 #if !defined(PB_X86_64) && !defined(PB_ARM64)
 #error Currently only x86_64 and arm64 are supported
 #endif
@@ -92,11 +96,28 @@ MODULE_PARM_DESC(data, "Armed data range start-end, hex, for the read trace");
 
 static LIST_HEAD(marea_list);
 static DEFINE_MUTEX(marea_lock);
+
+/*
+ * Serializes a target's mprotect, pkey_mprotect, mmap, munmap and mremap,
+ * from the record updates before the syscall to the settling after it. A
+ * failed mprotect puts back the records it changed, and that is only right
+ * if no other of these calls changed the same pages in the meantime. Taken
+ * before any mm lock and before marea_lock, never under them. Fault paths
+ * do not take it: they run with no mm lock held, and only restore pages
+ * their records already allow.
+ */
+static DEFINE_MUTEX(pb_vm_lock);
 static unsigned long epoch_counter;
 
+/*
+ * own: the tgid has records of its own, and a fault must not fall back to
+ * the parent's. It is false only for a forked child whose parent has not
+ * finished copying its records into it. It only ever turns on.
+ */
 struct pb_tgid {
 	struct list_head list;
 	pid_t tgid;
+	bool own;
 };
 
 static LIST_HEAD(tgid_list);
@@ -253,27 +274,66 @@ static bool pb_tgid_has(pid_t tgid)
 	return found;
 }
 
-static void pb_tgid_add(pid_t tgid)
+/* Returns true if the tgid was not listed before. */
+static bool pb_tgid_add(pid_t tgid, bool own)
 {
 	struct pb_tgid *t, *n;
 
 	if (tgid <= 0)
-		return;
+		return false;
 	n = kmalloc(sizeof(*n), GFP_KERNEL);
 	if (!n)
-		return;
+		return false;
 	n->tgid = tgid;
+	n->own = own;
 	INIT_LIST_HEAD(&n->list);
 	spin_lock(&tgid_lock);
 	list_for_each_entry(t, &tgid_list, list) {
 		if (t->tgid == tgid) {
+			if (own)
+				t->own = true;
 			spin_unlock(&tgid_lock);
 			kfree(n);
-			return;
+			return false;
 		}
 	}
 	list_add(&n->list, &tgid_list);
 	spin_unlock(&tgid_lock);
+	return true;
+}
+
+static bool pb_tgid_own(pid_t tgid)
+{
+	struct pb_tgid *t;
+	bool own = false;
+
+	spin_lock(&tgid_lock);
+	list_for_each_entry(t, &tgid_list, list) {
+		if (t->tgid == tgid) {
+			own = t->own;
+			break;
+		}
+	}
+	spin_unlock(&tgid_lock);
+	return own;
+}
+
+/* Returns the previous value, false if the tgid is not listed. */
+static bool pb_tgid_set_own(pid_t tgid, bool own)
+{
+	struct pb_tgid *t;
+	bool was = false;
+
+	spin_lock(&tgid_lock);
+	list_for_each_entry(t, &tgid_list, list) {
+		if (t->tgid == tgid) {
+			was = t->own;
+			t->own = own;
+			break;
+		}
+	}
+	spin_unlock(&tgid_lock);
+	return was;
 }
 
 static void pb_tgid_del(pid_t tgid)
@@ -302,7 +362,7 @@ static void pb_tgid_clear(void)
 	spin_unlock(&tgid_lock);
 }
 
-static bool pb_parent_tracked(void)
+static pid_t pb_parent_tgid(void)
 {
 	struct task_struct *parent;
 	pid_t tgid = 0;
@@ -312,20 +372,34 @@ static bool pb_parent_tracked(void)
 	if (parent)
 		tgid = parent->tgid;
 	rcu_read_unlock();
+	return tgid;
+}
+
+static bool pb_parent_tracked(void)
+{
+	pid_t tgid = pb_parent_tgid();
+
 	return tgid > 0 && pb_tgid_has(tgid);
 }
 
 static bool pb_is_target(void)
 {
 	pid_t tgid;
+	bool parent;
 
 	if (!path || !path[0])
 		return false;
 	tgid = current->tgid;
 	if (pb_tgid_has(tgid))
 		return true;
-	if (pb_parent_tracked() || pb_name_matches(current->comm)) {
-		pb_tgid_add(tgid);
+	/*
+	 * A child of a tracked process does not own its records until the
+	 * parent has copied them in pb_note_child. A fork child keeps the
+	 * parent's comm, so the name match alone does not make it own them.
+	 */
+	parent = pb_parent_tracked();
+	if (parent || pb_name_matches(current->comm)) {
+		pb_tgid_add(tgid, !parent);
 		return true;
 	}
 	return false;
@@ -431,6 +505,16 @@ static struct marea *new_marea(pid_t tgid, unsigned long addr, unsigned long pro
 	return new_m;
 }
 
+static void pb_free_list(struct list_head *head)
+{
+	struct marea *entry, *tmp;
+
+	list_for_each_entry_safe(entry, tmp, head, list) {
+		list_del(&entry->list);
+		kfree(entry);
+	}
+}
+
 static void track_pages(unsigned long addr, int n_pages, unsigned long prot)
 {
 	pid_t tgid = current->tgid;
@@ -502,13 +586,24 @@ static void clear_tracked(void)
 	mutex_unlock(&marea_lock);
 }
 
+/*
+ * Like pb_handle_data, a fork child that the parent has not copied into
+ * yet uses the parent's record. Its pages are the parent's, W^X write
+ * protection included, so a store to an RWX page in that window is a fault
+ * the module caused. Read own before the child's records, for the same
+ * reason as there.
+ */
 static bool pb_take_page(unsigned long addr, unsigned long *page_addr, unsigned long *prot)
 {
 	struct marea *page;
 	bool found = false;
+	bool use_parent = !pb_tgid_own(current->tgid);
+	pid_t parent = pb_parent_tgid();
 
 	mutex_lock(&marea_lock);
 	page = search_page(current->tgid, addr);
+	if (!page && use_parent && parent > 0 && parent != current->tgid)
+		page = search_page(parent, addr);
 	if (page) {
 		*page_addr = page->addr;
 		*prot = page->prot;
@@ -541,9 +636,32 @@ static void pb_note_epoch(pid_t tgid, unsigned long page, unsigned long epoch)
 	mutex_unlock(&marea_lock);
 }
 
+/*
+ * The program sets comm (prctl, the exec name), and it may hold spaces or
+ * a newline. The index is one record per line, split on whitespace, so a
+ * raw comm could shift the fields or forge a line. Replace whitespace and
+ * control bytes, and write "-" for an empty name.
+ */
+static void pb_index_comm(char *out)
+{
+	size_t i;
+
+	if (!out[0]) {
+		strcpy(out, "-");
+		return;
+	}
+	for (i = 0; out[i]; i++) {
+		unsigned char c = out[i];
+
+		if (c <= ' ' || c == 0x7f)
+			out[i] = '_';
+	}
+}
+
 static int dump_to_file(unsigned long user_addr, size_t size, const char *why,
 			 unsigned long *ep_out)
 {
+	char comm[TASK_COMM_LEN];
 	struct file *dest;
 	char file_path[64];
 	char line[160];
@@ -589,8 +707,10 @@ static int dump_to_file(unsigned long user_addr, size_t size, const char *why,
 	if (written < 0 || (size_t)written != size)
 		return written < 0 ? written : -EIO;
 	pb_note_epoch(tgid, user_addr, ep);
+	get_task_comm(comm, current);
+	pb_index_comm(comm);
 	snprintf(line, sizeof(line), "%d %s %lx %lu %s\n", tgid,
-		 current->comm[0] ? current->comm : "-", user_addr, ep, why);
+		 comm, user_addr, ep, why);
 	pb_log_line("/tmp/pagedrop.index", line);
 	if (ep_out)
 		*ep_out = ep;
@@ -738,10 +858,13 @@ static long pb_mprotect(unsigned long addr, unsigned long len, unsigned long pro
 /*
  * Restore before forgetting, but never while holding marea_lock.
  *
- * pb_mprotect reaches the real mprotect, which wants mmap_write_lock, and
- * fh_vm_mmap_pgoff already runs under that lock and takes marea_lock. Doing
- * one inside the other is an ABBA deadlock. So: collect the pages under the
- * lock, restore with no lock held, then drop the records.
+ * pb_mprotect reaches the real mprotect, which takes mmap_write_lock. No
+ * path takes marea_lock with an mm lock held: vm_mmap_pgoff takes and
+ * releases mmap_write_lock itself, before the hook drops records, and the
+ * fault paths release theirs before the signal. Keeping marea_lock out of
+ * the mm lock is a lock-order rule, not the fix for a deadlock that was
+ * shown. So: collect the pages under the lock, restore with no lock held,
+ * then drop the records.
  *
  * The records outlive the restore, so a reader that faults meanwhile finds
  * one and is handled. A restore that lands on a page a reader already fixed
@@ -1073,36 +1196,314 @@ static void pb_read_armed(unsigned long addr, unsigned long len)
 	}
 }
 
-static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
+/*
+ * [start, end) of the pages an mprotect of len bytes at addr covers,
+ * computed as do_mprotect_pkey does. A length that wraps, which the kernel
+ * rejects with -ENOMEM, gives end == ~0UL. pb_page_count returns an int
+ * and would truncate a huge length.
+ */
+static void pb_protect_range(unsigned long addr, unsigned long len,
+			     unsigned long *start, unsigned long *end)
 {
-	unsigned long prot;
+	unsigned long alen = (len + PAGE_SIZE - 1) & PAGE_MASK;
 
-	if (!pb_is_target())
-		return real_sys_mprotect(regs);
-	prot = pb_arg(regs, 2);
+	*start = addr & PAGE_MASK;
+	*end = *start + alen;
+	if (len && (!alen || *end <= *start))
+		*end = ~0UL;
+}
+
+/* Copy this tgid's tracked records in [start, end) to snap. */
+static void pb_snapshot_tracked(unsigned long start, unsigned long end,
+				struct list_head *snap)
+{
+	struct marea *entry, *copy;
+	pid_t tgid = current->tgid;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(entry, &marea_list, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		copy = new_marea(tgid, entry->addr, entry->prot);
+		if (!copy)
+			continue;
+		copy->epoch = entry->epoch;
+		list_add_tail(&copy->list, snap);
+	}
+	mutex_unlock(&marea_lock);
+}
+
+/* A piece of [start, end) with one protection; prot is -1 for a hole. */
+struct pb_seg {
+	struct list_head list;
+	unsigned long start;
+	unsigned long end;
+	long prot;
+};
+
+static long pb_vma_prot(struct vm_area_struct *vma)
+{
+	long prot = 0;
+
+	if (vma->vm_flags & VM_READ)
+		prot |= PROT_READ;
+	if (vma->vm_flags & VM_WRITE)
+		prot |= PROT_WRITE;
+	if (vma->vm_flags & VM_EXEC)
+		prot |= PROT_EXEC;
+	return prot;
+}
+
+static bool pb_seg_add(struct list_head *segs, unsigned long start,
+		       unsigned long end, long prot)
+{
+	struct pb_seg *seg = kmalloc(sizeof(*seg), GFP_KERNEL);
+
+	if (!seg)
+		return false;
+	seg->start = start;
+	seg->end = end;
+	seg->prot = prot;
+	list_add_tail(&seg->list, segs);
+	return true;
+}
+
+static void pb_seg_free(struct list_head *segs)
+{
+	struct pb_seg *seg, *tmp;
+
+	list_for_each_entry_safe(seg, tmp, segs, list) {
+		list_del(&seg->list);
+		kfree(seg);
+	}
+}
+
+/*
+ * Record the protection of every piece of [start, end), holes included,
+ * as it is right before the syscall. Returns false if that could not be
+ * done; the caller then treats a failure as having changed nothing.
+ */
+static bool pb_seg_snapshot(unsigned long start, unsigned long end,
+			    struct list_head *segs)
+{
+	struct vm_area_struct *vma;
+	unsigned long at = start;
+	bool ok = true;
+
+	if (!current->mm || mmap_read_lock_killable(current->mm))
+		return false;
+	while (ok && at < end) {
+		vma = find_vma(current->mm, at);
+		if (!vma || vma->vm_start >= end) {
+			ok = pb_seg_add(segs, at, end, -1);
+			break;
+		}
+		if (vma->vm_start > at) {
+			ok = pb_seg_add(segs, at, vma->vm_start, -1);
+			at = vma->vm_start;
+			continue;
+		}
+		ok = pb_seg_add(segs, at, min(vma->vm_end, end), pb_vma_prot(vma));
+		at = min(vma->vm_end, end);
+	}
+	mmap_read_unlock(current->mm);
+	if (!ok)
+		pb_seg_free(segs);
+	return ok;
+}
+
+/* Whether all of [start, end) still has protection prot (-1: unmapped). */
+static bool pb_seg_same(unsigned long start, unsigned long end, long prot)
+{
+	struct vm_area_struct *vma;
+	unsigned long at = start;
+
+	while (at < end) {
+		vma = find_vma(current->mm, at);
+		if (!vma || vma->vm_start >= end)
+			return prot == -1;
+		if (vma->vm_start > at) {
+			if (prot != -1)
+				return false;
+			at = vma->vm_start;
+			continue;
+		}
+		if (prot != pb_vma_prot(vma))
+			return false;
+		at = min(vma->vm_end, end);
+	}
+	return true;
+}
+
+/*
+ * Whether vma has the protection mprotect would give it for prot. With
+ * READ_IMPLIES_EXEC the kernel adds PROT_EXEC to a readable request, per
+ * VMA, where VM_MAYEXEC allows it.
+ */
+static bool pb_vma_has(struct vm_area_struct *vma, unsigned long prot)
+{
+	long want = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
+	long have = pb_vma_prot(vma);
+
+	if (have == want)
+		return true;
+	return (current->personality & READ_IMPLIES_EXEC) && (want & PROT_READ) &&
+	       (vma->vm_flags & VM_MAYEXEC) && have == (want | PROT_EXEC);
+}
+
+/*
+ * End of the part of [start, end) that a failed mprotect did apply.
+ *
+ * do_mprotect_pkey fails before touching any VMA only with -EINVAL (an
+ * unaligned start, an invalid prot bit, an unallocated pkey), -EINTR, or
+ * -ENOMEM (a length that wraps, or start not mapped). Otherwise it works
+ * VMA by VMA from start, leaves the VMA that fails as it was, and stops.
+ * So, unless it failed up front, what it applied is the run of VMAs from
+ * start that now have the requested protection, up to the first hole or
+ * the first VMA that does not. A VMA that already had that protection
+ * counts: the call passed over it before failing further on, as when a
+ * hole follows it.
+ *
+ * Whether -EINVAL or -EINTR came up front cannot be read off the VMAs: a
+ * VMA that already had the requested protection looks the same either way.
+ * If nothing changed, they are taken as up front. The one in-loop -EINVAL,
+ * from arch_validate_flags or a driver's vm_ops->mprotect, is then
+ * mistaken for it when only unchanged VMAs came first, and those keep
+ * their old records. A wrapping length is caught here as end == ~0UL, and
+ * an unmapped start stops the walk at once.
+ *
+ * -ENOSYS means the syscall does not exist here, so nothing was applied.
+ * arm64 before 6.12 has no CONFIG_ARCH_HAS_PKEYS, and pkey_mprotect is
+ * sys_ni_syscall. The VMAs cannot show this either: a W^X page the module
+ * keeps read-execute already looks like a pkey_mprotect(RX) that worked.
+ */
+static unsigned long pb_protect_done(unsigned long start, unsigned long end,
+				     unsigned long prot, long ret,
+				     struct list_head *segs)
+{
+	struct vm_area_struct *vma;
+	struct pb_seg *seg;
+	unsigned long at = start;
+	bool changed = false;
+
+	if (ret == -ENOSYS || end == ~0UL || !current->mm ||
+	    mmap_read_lock_killable(current->mm))
+		return start;
+	list_for_each_entry(seg, segs, list) {
+		if (!pb_seg_same(seg->start, seg->end, seg->prot)) {
+			changed = true;
+			break;
+		}
+	}
+	if (!changed && (ret == -EINVAL || ret == -EINTR))
+		goto out;
+	while (at < end) {
+		vma = find_vma(current->mm, at);
+		if (!vma || vma->vm_start > at || !pb_vma_has(vma, prot))
+			break;
+		at = min(vma->vm_end, end);
+	}
+out:
+	mmap_read_unlock(current->mm);
+	return at;
+}
+
+/*
+ * pb_handle_protect updates the tracked records before the syscall, so
+ * that no page is ever stripped of PROT_WRITE without a record saying the
+ * write is allowed. If the syscall then fails, the pages it did not change
+ * must get their old records back: a W^X page untracked by a failed
+ * mprotect would turn its next legal store into a SIGSEGV, and a record
+ * left by a failed mprotect(RWX) would let the module make a page
+ * executable that never was. pb_vm_lock keeps any other mprotect, mmap,
+ * munmap or mremap of this process from changing those records between
+ * the snapshot and here. Armed data records are not put back. The disarm
+ * restored those pages first, so they stay accessible, and the next arm
+ * attempt arms them again.
+ */
+static void pb_settle_tracked(unsigned long start, unsigned long end,
+			      unsigned long prot, long ret, struct list_head *snap,
+			      struct list_head *segs, bool have_segs)
+{
+	struct marea *entry, *tmp;
+	pid_t tgid = current->tgid;
+	unsigned long done;
+
+	if (ret == 0) {
+		pb_free_list(snap);
+		return;
+	}
+	done = have_segs ? pb_protect_done(start, end, prot, ret, segs) : start;
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &marea_list, list) {
+		if (entry->tgid != tgid || entry->addr < done || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	list_for_each_entry_safe(entry, tmp, snap, list) {
+		if (entry->addr < done || entry->addr >= end)
+			continue;
+		list_move(&entry->list, &marea_list);
+	}
+	mutex_unlock(&marea_lock);
+	pb_free_list(snap);
+}
+
+/*
+ * mprotect and pkey_mprotect. regs is the caller's saved register file,
+ * restored on return to user space. pb_handle_protect may clear
+ * PROT_WRITE in the prot argument, so do that in a copy: the syscall ABI
+ * preserves rdx/x2, and a changed prot there breaks raw-syscall callers
+ * and shows that the module is loaded.
+ */
+static long pb_protect_syscall(struct pt_regs *regs, long (*real)(struct pt_regs *))
+{
+	struct pt_regs args;
+	unsigned long prot;
+	unsigned long start, end;
+	LIST_HEAD(snap);
+	LIST_HEAD(segs);
+	bool have_segs;
+	long ret;
+
+	if (mutex_lock_killable(&pb_vm_lock))
+		return -EINTR;
+	args = *regs;
+	prot = pb_arg(&args, 2);
+	pb_protect_range(pb_arg(&args, 0), pb_arg(&args, 1), &start, &end);
 	if (prot & PROT_EXEC)
-		pb_read_armed(pb_arg(regs, 0), pb_arg(regs, 1));
-	pb_handle_protect(regs);
+		pb_read_armed(pb_arg(&args, 0), pb_arg(&args, 1));
+	pb_snapshot_tracked(start, end, &snap);
+	pb_handle_protect(&args);
 	if (prot_has_x_only(prot) || prot_has_wx(prot))
 		pb_try_arm();
-	return real_sys_mprotect(regs);
+	/*
+	 * Taken last, after the module's own restores and arming, so that
+	 * only the syscall's changes show up in the comparison.
+	 */
+	have_segs = pb_seg_snapshot(start, end, &segs);
+	ret = real(&args);
+	pb_settle_tracked(start, end, pb_arg(&args, 2), ret, &snap, &segs, have_segs);
+	pb_seg_free(&segs);
+	mutex_unlock(&pb_vm_lock);
+	return ret;
+}
+
+static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
+{
+	if (!pb_is_target())
+		return real_sys_mprotect(regs);
+	return pb_protect_syscall(regs, real_sys_mprotect);
 }
 
 static asmlinkage long (*real_sys_pkey_mprotect)(struct pt_regs *regs);
 
 static asmlinkage long fh_sys_pkey_mprotect(struct pt_regs *regs)
 {
-	unsigned long prot;
-
 	if (!pb_is_target())
 		return real_sys_pkey_mprotect(regs);
-	prot = pb_arg(regs, 2);
-	if (prot & PROT_EXEC)
-		pb_read_armed(pb_arg(regs, 0), pb_arg(regs, 1));
-	pb_handle_protect(regs);
-	if (prot_has_x_only(prot) || prot_has_wx(prot))
-		pb_try_arm();
-	return real_sys_pkey_mprotect(regs);
+	return pb_protect_syscall(regs, real_sys_pkey_mprotect);
 }
 
 static bool pb_page_exec(unsigned long addr)
@@ -1170,11 +1571,10 @@ static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, 
 	}
 	mutex_unlock(&marea_lock);
 	/*
-	 * Restore before forgetting, and outside the lock for the same reason
-	 * as pb_disarm_range: pb_mprotect wants mmap_write_lock, which the
-	 * mmap hook already holds while taking marea_lock. Re-validate first,
-	 * so a page re-armed with a different protection in the gap is not
-	 * overwritten with the value we read before the move.
+	 * Restore before forgetting, and outside marea_lock, by the lock-order
+	 * rule in front of pb_disarm_range. Re-validate first, so a page
+	 * re-armed with a different protection in the gap is not overwritten
+	 * with the value we read before the move.
 	 */
 	if (found && keep && !in_range && pb_armed_unchanged(tgid, want, prot)) {
 		if (pb_mprotect(to, PAGE_SIZE, prot ? prot : PROT_READ))
@@ -1205,8 +1605,13 @@ static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, 
 		pb_mprotect(to, PAGE_SIZE, prot ? prot : PROT_READ);
 }
 
+/*
+ * dontunmap: MREMAP_DONTUNMAP left the source mapped, with its protection,
+ * so a tracked page is now at both addresses and keeps a record at each.
+ */
 static void pb_note_mremap(unsigned long old, unsigned long old_len,
-			   unsigned long new, unsigned long new_len, bool pre)
+			   unsigned long new, unsigned long new_len, bool pre,
+			   bool dontunmap)
 {
 	unsigned long old_pages = pb_page_count(old_len);
 	unsigned long new_pages = pb_page_count(new_len);
@@ -1214,6 +1619,24 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 
 	old &= PAGE_MASK;
 	new &= PAGE_MASK;
+	/*
+	 * A move to a range apart from the source replaced whatever was
+	 * mapped there, so its tracked records go before the moved ones
+	 * arrive. A resize in place overlaps the source and keeps them.
+	 */
+	if (new + new_pages * PAGE_SIZE <= old || old + old_pages * PAGE_SIZE <= new) {
+		struct marea *entry, *tmp;
+
+		mutex_lock(&marea_lock);
+		list_for_each_entry_safe(entry, tmp, &marea_list, list) {
+			if (entry->tgid != current->tgid || entry->addr < new ||
+			    entry->addr >= new + new_pages * PAGE_SIZE)
+				continue;
+			list_del(&entry->list);
+			kfree(entry);
+		}
+		mutex_unlock(&marea_lock);
+	}
 	for (i = 0; i < old_pages; i++) {
 		struct marea *entry;
 		unsigned long from = old + i * PAGE_SIZE;
@@ -1223,7 +1646,16 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 		mutex_lock(&marea_lock);
 		entry = search_page(current->tgid, from);
 		if (entry) {
-			if (keep)
+			if (keep && dontunmap) {
+				struct marea *fresh;
+
+				fresh = new_marea(current->tgid, new + i * PAGE_SIZE,
+						  entry->prot);
+				if (fresh) {
+					fresh->epoch = entry->epoch;
+					list_add(&fresh->list, &marea_list);
+				}
+			} else if (keep)
 				entry->addr = new + i * PAGE_SIZE;
 			else {
 				list_del(&entry->list);
@@ -1281,7 +1713,7 @@ static void pb_release_armed(pid_t tgid, unsigned long page)
 	(void)found;
 }
 
-static asmlinkage long fh_sys_mremap(struct pt_regs *regs)
+static long pb_mremap(struct pt_regs *regs)
 {
 	unsigned long old = pb_arg(regs, 0);
 	unsigned long old_len = pb_arg(regs, 1);
@@ -1295,16 +1727,48 @@ static asmlinkage long fh_sys_mremap(struct pt_regs *regs)
 	int i;
 	long ret;
 
-	if (!pb_is_target())
-		return real_sys_mremap(regs);
-	/*
-	 * MREMAP_FIXED names the destination now, so settle each page before
-	 * the kernel moves it. A page that lands outside the armed range is
-	 * made accessible first: nothing would restore it once it is there,
-	 * and a reader would take a signal this module caused. A page that
-	 * stays in range keeps its record, relocated ahead of the move.
-	 */
 	if (flags & MREMAP_FIXED) {
+		/*
+		 * The kernel unmaps whatever is at the destination before
+		 * moving there. An armed record of that old mapping must not
+		 * survive next to the one that arrives with the moved page:
+		 * both would sit at the same address, and the old saved
+		 * protection could be restored on the new page. Release the
+		 * destination first. If the syscall fails, those pages are
+		 * merely accessible and get armed again later.
+		 */
+		for (i = 0; i < pb_page_count(new_len); i++)
+			pb_release_armed(tgid, new_addr + (unsigned long)i * PAGE_SIZE);
+	}
+	if (flags & MREMAP_DONTUNMAP) {
+		/*
+		 * The kernel moves the pages and keeps the source VMA, with
+		 * its protection. An armed source would stay PROT_NONE for
+		 * good while its record went with the page, and every later
+		 * access to the source would be a SIGSEGV the module caused.
+		 * Release first, as for a resizing move: both ends arrive
+		 * accessible, and the moved page is re-armed by the next
+		 * executable mprotect. DONTUNMAP always moves, even at the
+		 * same size, so the size test below does not apply to it.
+		 */
+		for (i = 0; i < n_pages; i++)
+			pb_release_armed(tgid, old + (unsigned long)i * PAGE_SIZE);
+	} else if (flags & MREMAP_FIXED) {
+		/*
+		 * MREMAP_FIXED names the destination now, so settle each page
+		 * before the kernel moves it. A page that lands outside the
+		 * armed range is made accessible first: nothing would restore
+		 * it once it is there, and a reader would take a signal this
+		 * module caused. A page that stays in range keeps its record,
+		 * relocated ahead of the move.
+		 *
+		 * Known gap: from here until the kernel moves the page, the
+		 * source is still PROT_NONE and its record is already at the
+		 * destination, so a read of the source in that window takes a
+		 * SIGSEGV. Without the module the source is unmapped once the
+		 * move completes, so a program reading it concurrently with
+		 * its own mremap is already racing.
+		 */
 		for (i = 0; i < n_pages; i++) {
 			unsigned long to = new_addr + (unsigned long)i * PAGE_SIZE;
 			unsigned long from = old + (unsigned long)i * PAGE_SIZE;
@@ -1335,7 +1799,21 @@ static asmlinkage long fh_sys_mremap(struct pt_regs *regs)
 						  old + (unsigned long)i * PAGE_SIZE);
 		return ret;
 	}
-	pb_note_mremap(old, old_len, (unsigned long)ret, new_len, pre);
+	pb_note_mremap(old, old_len, (unsigned long)ret, new_len, pre,
+		       flags & MREMAP_DONTUNMAP);
+	return ret;
+}
+
+static asmlinkage long fh_sys_mremap(struct pt_regs *regs)
+{
+	long ret;
+
+	if (!pb_is_target())
+		return real_sys_mremap(regs);
+	if (mutex_lock_killable(&pb_vm_lock))
+		return -EINTR;
+	ret = pb_mremap(regs);
+	mutex_unlock(&pb_vm_lock);
 	return ret;
 }
 
@@ -1349,9 +1827,12 @@ static asmlinkage long fh_sys_munmap(struct pt_regs *regs)
 
 	if (!pb_is_target())
 		return real_sys_munmap(regs);
+	if (mutex_lock_killable(&pb_vm_lock))
+		return -EINTR;
 	ret = real_sys_munmap(regs);
 	if (!ret)
 		pb_drop_user_range(current->tgid, addr, len);
+	mutex_unlock(&pb_vm_lock);
 	return ret;
 }
 
@@ -1359,16 +1840,13 @@ static asmlinkage unsigned long (*real_vm_mmap_pgoff)(struct file *file,
 		unsigned long addr, unsigned long len, unsigned long prot,
 		unsigned long flag, unsigned long pgoff);
 
-static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
+static unsigned long pb_vm_mmap(struct file *file,
 		unsigned long addr, unsigned long len, unsigned long prot,
 		unsigned long flag, unsigned long pgoff)
 {
 	unsigned long ret;
 	unsigned long intended;
 	int n_pages;
-
-	if (!pb_is_target())
-		return real_vm_mmap_pgoff(file, addr, len, prot, flag, pgoff);
 
 	n_pages = pb_page_count(len);
 
@@ -1378,8 +1856,16 @@ static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
 			flag |= MAP_POPULATE;
 		ret = real_vm_mmap_pgoff(file, addr, len, prot & ~PROT_WRITE,
 					 flag, pgoff);
-		if (!IS_ERR_VALUE(ret))
-			track_pages(ret, n_pages, intended);
+		if (IS_ERR_VALUE(ret))
+			return ret;
+		/*
+		 * A MAP_FIXED mapping replaces whatever was there. Drop its
+		 * armed, seen and tracked records first, as the other branch
+		 * does, or the new pages inherit an old saved protection and
+		 * the old epoch.
+		 */
+		pb_drop_user_range(current->tgid, ret, (unsigned long)n_pages * PAGE_SIZE);
+		track_pages(ret, n_pages, intended);
 		return ret;
 	}
 
@@ -1402,6 +1888,21 @@ static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
 		untrack_pages(ret, n_pages);
 	}
 
+	return ret;
+}
+
+static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
+		unsigned long addr, unsigned long len, unsigned long prot,
+		unsigned long flag, unsigned long pgoff)
+{
+	unsigned long ret;
+
+	if (!pb_is_target())
+		return real_vm_mmap_pgoff(file, addr, len, prot, flag, pgoff);
+	if (mutex_lock_killable(&pb_vm_lock))
+		return -EINTR;
+	ret = pb_vm_mmap(file, addr, len, prot, flag, pgoff);
+	mutex_unlock(&pb_vm_lock);
 	return ret;
 }
 
@@ -1445,19 +1946,6 @@ static unsigned long pb_fault_ip(void)
 	return ip;
 }
 
-static pid_t pb_parent_tgid(void)
-{
-	struct task_struct *parent;
-	pid_t tgid = 0;
-
-	rcu_read_lock();
-	parent = rcu_dereference(current->real_parent);
-	if (parent)
-		tgid = parent->tgid;
-	rcu_read_unlock();
-	return tgid;
-}
-
 static bool pb_ip_tracked_for(pid_t tgid, unsigned long ip, unsigned long *epoch)
 {
 	struct marea *page;
@@ -1473,11 +1961,17 @@ static bool pb_ip_tracked_for(pid_t tgid, unsigned long ip, unsigned long *epoch
 	return found;
 }
 
+/*
+ * The parent's records stand in for a fork child's only until the parent
+ * has copied them, see pb_handle_data. Read own first, for the same reason.
+ */
 static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
 {
+	bool use_parent = !pb_tgid_own(current->tgid);
+
 	if (pb_ip_tracked_for(current->tgid, ip, epoch))
 		return true;
-	return pb_ip_tracked_for(pb_parent_tgid(), ip, epoch);
+	return use_parent && pb_ip_tracked_for(pb_parent_tgid(), ip, epoch);
 }
 
 static bool pb_armed_prot_for(pid_t tgid, unsigned long page, unsigned long *prot_out)
@@ -1552,9 +2046,19 @@ static int pb_handle_data(unsigned long address)
 	pid_t parent;
 	struct pt_regs *regs;
 	struct marea *armed_entry;
+	bool use_parent;
 	bool tracked;
 	bool armed;
 
+	/*
+	 * The parent's armed records cover a fork child only in the window
+	 * before pb_note_child has copied them. After the copy, or after an
+	 * exec, the child's own records are the whole truth, and a PROT_NONE
+	 * page of the child's own (a guard page, a GC barrier) must fault to
+	 * the child's handler. Read own before the child's records: once it
+	 * reads true, the copy is complete under marea_lock.
+	 */
+	use_parent = !pb_tgid_own(tgid);
 	/*
 	 * The record, not the range, decides ownership. An mremap can carry
 	 * a page we made inaccessible out of the range, and only a record for
@@ -1562,7 +2066,7 @@ static int pb_handle_data(unsigned long address)
 	 */
 	armed = pb_armed_prot_for(tgid, page, &restore);
 	parent = pb_parent_tgid();
-	if (!armed && parent > 0 && parent != tgid)
+	if (!armed && use_parent && parent > 0 && parent != tgid)
 		armed = pb_armed_prot_for(parent, page, &restore);
 	if (!armed || !restore) {
 		/*
@@ -1636,6 +2140,22 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 		return 0;
 
 	if (!pb_take_page(address, &page_addr, &new_prot))
+		return real_force_sig_fault(sig, code, addr);
+
+	/*
+	 * A protection-key fault is not about the page's protection, and
+	 * mprotect keeps the key, so the access would fault again.
+	 */
+	if (code == SEGV_PKUERR)
+		return real_force_sig_fault(sig, code, addr);
+	/*
+	 * Only a write the module forbade, by clearing PROT_WRITE from a W+X
+	 * request, is ours to allow. A tracked page whose saved prot has no
+	 * PROT_WRITE is plain read-only code. Restoring it without exec would
+	 * leave it read-only, the same store would fault again, and the
+	 * program would spin here instead of getting its SIGSEGV.
+	 */
+	if (pb_fault_is_write() && !(new_prot & PROT_WRITE))
 		return real_force_sig_fault(sig, code, addr);
 
 	regs = kzalloc(sizeof(*regs), GFP_KERNEL);
@@ -1743,14 +2263,24 @@ static void pb_move_tracked(struct list_head *saved)
 	mutex_unlock(&marea_lock);
 }
 
-static void pb_free_list(struct list_head *head)
+static void pb_copy_list(struct list_head *head, pid_t from, pid_t to)
 {
-	struct marea *entry, *tmp;
+	struct marea *entry, *fresh;
+	LIST_HEAD(add);
 
-	list_for_each_entry_safe(entry, tmp, head, list) {
-		list_del(&entry->list);
-		kfree(entry);
+	list_for_each_entry(entry, head, list) {
+		if (entry->tgid != from)
+			continue;
+		fresh = new_marea(to, entry->addr, entry->prot);
+		if (!fresh)
+			continue;
+		fresh->epoch = entry->epoch;
+		/* A child inherits the page exactly as accessible or as
+		 * inaccessible, so the pin state has to be copied with it. */
+		fresh->restored = entry->restored;
+		list_add(&fresh->list, &add);
 	}
+	list_splice(&add, head);
 }
 
 static long pb_finish_exec(struct list_head *saved, bool matched, long ret)
@@ -1770,24 +2300,60 @@ static long pb_finish_exec(struct list_head *saved, bool matched, long ret)
 static long pb_do_exec(bool matched, long (*real)(struct pt_regs *), struct pt_regs *regs)
 {
 	bool added = false;
+	bool inherited = false;
 	bool tracked;
 	long ret;
 	pid_t tgid = current->tgid;
+	pid_t parent;
 	LIST_HEAD(saved);
 
 	tracked = pb_tgid_has(tgid);
-	if (matched) {
-		added = !tracked;
-		pb_tgid_add(tgid);
-		pb_move_tracked(&saved);
+	/*
+	 * The new image has none of the old pages, so it owns its records
+	 * from here on and must never get the parent's. Set the mark under
+	 * marea_lock, before the exec, so a parent still in pb_note_child
+	 * either copied before this, or sees the mark and copies nothing.
+	 * After vfork, and posix_spawn, the parent only runs once the child
+	 * has exec'd, so it is always the second case.
+	 *
+	 * In that case do the parent's copy here, in the same hold. The exec
+	 * can still fail and leave the old image running, and that image
+	 * needs the records it inherited. The parent is still alive at this
+	 * point: it has not finished pb_note_child, so it has not returned
+	 * from fork. Waiting for the failure to copy would be too late, as
+	 * the parent may have exited by then. On success the drop below, or
+	 * pb_move_tracked for a matching path, removes the copy with the rest.
+	 *
+	 * A child of a tracked process counts as tracked here, even if
+	 * pb_is_target has not listed it yet.
+	 */
+	if (matched || tracked || pb_parent_tracked()) {
+		parent = pb_parent_tgid();
+		mutex_lock(&marea_lock);
+		if (!pb_tgid_own(tgid) && parent > 0 && parent != tgid &&
+		    pb_tgid_has(parent)) {
+			pb_copy_list(&data_armed, parent, tgid);
+			pb_copy_list(&marea_list, parent, tgid);
+			inherited = true;
+		}
+		added = pb_tgid_add(tgid, true);
+		mutex_unlock(&marea_lock);
+		tracked = true;
 	}
+	if (matched)
+		pb_move_tracked(&saved);
 	ret = real(regs);
-	if (ret == 0 && (matched || tracked)) {
+	if (ret == 0 && tracked) {
 		pb_drop_data_state(tgid);
 		if (!matched)
 			pb_drop_marea(tgid);
 	}
-	if (matched && ret != 0 && added)
+	/*
+	 * A failed exec keeps the old image and the mark. A tgid this exec
+	 * listed for a matching path, with nothing inherited, is unlisted
+	 * again, as before.
+	 */
+	if (ret != 0 && added && !inherited)
 		pb_tgid_del(tgid);
 	return pb_finish_exec(&saved, matched, ret);
 }
@@ -1816,49 +2382,53 @@ static asmlinkage long fh_sys_execveat(struct pt_regs *regs)
 	return pb_do_exec(matched, real_sys_execveat, regs);
 }
 
-static void pb_copy_list(struct list_head *head, pid_t from, pid_t to)
-{
-	struct marea *entry, *fresh;
-	LIST_HEAD(add);
-
-	list_for_each_entry(entry, head, list) {
-		if (entry->tgid != from)
-			continue;
-		fresh = new_marea(to, entry->addr, entry->prot);
-		if (!fresh)
-			continue;
-		fresh->epoch = entry->epoch;
-		/* A child inherits the page exactly as accessible or as
-		 * inaccessible, so the pin state has to be copied with it. */
-		fresh->restored = entry->restored;
-		list_add(&fresh->list, &add);
-	}
-	list_splice(&add, head);
-}
-
+/*
+ * Copy, and mark the child as owning its records, in one marea_lock hold.
+ * pb_do_exec sets the same mark under the same lock before an exec, and
+ * makes this copy itself then, so if the mark is already set the child has
+ * its copy, and this one copies nothing.
+ */
 static void pb_copy_tracking(pid_t from, pid_t to)
 {
 	mutex_lock(&marea_lock);
-	pb_copy_list(&data_armed, from, to);
-	pb_copy_list(&marea_list, from, to);
+	if (!pb_tgid_own(to)) {
+		pb_copy_list(&data_armed, from, to);
+		pb_copy_list(&marea_list, from, to);
+		pb_tgid_set_own(to, true);
+	}
 	mutex_unlock(&marea_lock);
 }
 
-static bool pb_child_alive(long child)
+/*
+ * fork and clone return the child's pid in the caller's pid namespace.
+ * Every record is keyed on the global tgid, so look the task up here and
+ * key the child on task_tgid_nr(). In a container the two numbers differ.
+ */
+static struct task_struct *pb_child_task(long child)
 {
 	struct pid *pid;
 	struct task_struct *task;
-	bool alive = false;
 
-	pid = find_vpid((pid_t)child);
+	pid = find_get_pid((pid_t)child);
 	if (!pid)
-		return false;
+		return NULL;
 	task = get_pid_task(pid, PIDTYPE_PID);
-	if (!task)
-		return false;
-	alive = !(task->flags & PF_EXITING) && task->exit_state == 0;
-	put_task_struct(task);
-	return alive;
+	put_pid(pid);
+	return task;
+}
+
+/*
+ * Whether the child's thread group is alive, not the task we looked up.
+ * That task is the leader at fork time. A leader can pthread_exit while
+ * its threads run on, and an exec from another thread makes that thread
+ * the leader and releases the old one, while the tgid lives on. signal is
+ * shared by the group, survives that exec, and stays valid while we hold
+ * the task. live counts the group's threads, and fh_exit_files cleans up
+ * only once it is 0.
+ */
+static bool pb_group_alive(struct task_struct *task)
+{
+	return atomic_read(&task->signal->live) > 0;
 }
 
 static void pb_drop_child(pid_t tgid)
@@ -1870,22 +2440,36 @@ static void pb_drop_child(pid_t tgid)
 
 static void pb_note_child(long child, unsigned long flags, bool has_flags)
 {
+	struct task_struct *task;
+	pid_t tgid;
+
 	if (child <= 0 || !pb_tgid_has(current->tgid))
 		return;
 	if (has_flags && (flags & CLONE_THREAD))
 		return;
+	task = pb_child_task(child);
+	if (!task)
+		return;
+	tgid = task_tgid_nr(task);
 	/*
 	 * The child runs as soon as the fork returns, and it can exit
 	 * before this bookkeeping. Registering a tgid that is already gone
 	 * would leave its records behind for whoever reuses that pid, so
 	 * check first, and drop again if the child died while copying.
+	 * The group's last thread brings live to 0 before fh_exit_files
+	 * takes marea_lock to clean up. If that cleanup ran before the
+	 * copy, the copy's own marea_lock hold makes live == 0 visible
+	 * here; if it runs after, it removes the copy. Holding the task
+	 * keeps the second check on this child even if its pid number is
+	 * reused.
 	 */
-	if (!pb_child_alive(child))
-		return;
-	pb_tgid_add((pid_t)child);
-	pb_copy_tracking(current->tgid, (pid_t)child);
-	if (!pb_child_alive(child))
-		pb_drop_child((pid_t)child);
+	if (pb_group_alive(task)) {
+		pb_tgid_add(tgid, false);
+		pb_copy_tracking(current->tgid, tgid);
+		if (!pb_group_alive(task))
+			pb_drop_child(tgid);
+	}
+	put_task_struct(task);
 }
 
 static asmlinkage long (*real_sys_fork)(struct pt_regs *regs);
@@ -1929,17 +2513,28 @@ static asmlinkage long fh_sys_clone3(struct pt_regs *regs)
 	return ret;
 }
 
-static void (*real_do_exit)(long code);
+static void (*real_exit_files)(struct task_struct *tsk);
 
-static void fh_do_exit(long code)
+/*
+ * do_exit sets PF_EXITING, then decrements signal->live, then calls
+ * exit_files. Testing live on entry to do_exit raced: two threads of an
+ * exit_group could both read 2 and neither drop the tgid. Here every
+ * exiting thread has already decremented, so live == 0 means the whole
+ * group is dead, and the last thread to decrement always sees it. More
+ * than one thread may see 0; the drops are idempotent. The tgid cannot
+ * be reused yet, because the leader is reaped only after exit_notify.
+ * exit_files is also called by copy_process on a failed fork, for a
+ * task that is not current, so that call is skipped.
+ */
+static void fh_exit_files(struct task_struct *tsk)
 {
-	if (current->signal && atomic_read(&current->signal->live) <= 1) {
+	if (tsk == current && (current->flags & PF_EXITING) &&
+	    current->signal && atomic_read(&current->signal->live) == 0) {
 		pb_drop_data_state(current->tgid);
 		pb_drop_marea(current->tgid);
 		pb_tgid_del(current->tgid);
 	}
-	real_do_exit(code);
-	BUG();
+	real_exit_files(tsk);
 }
 
 #if defined(PB_ARM64)
@@ -1977,7 +2572,7 @@ static struct ftrace_hook demo_hooks[] = {
 	HOOK("sys_vfork", fh_sys_vfork, &real_sys_vfork),
 	HOOK("sys_clone", fh_sys_clone, &real_sys_clone),
 	HOOK("sys_clone3", fh_sys_clone3, &real_sys_clone3),
-	HOOK_NOSYS("do_exit", fh_do_exit, &real_do_exit),
+	HOOK_NOSYS("exit_files", fh_exit_files, &real_exit_files),
 	HOOK_NOSYS("force_sig_fault", fh_force_sig_fault, &real_force_sig_fault),
 };
 
@@ -2021,7 +2616,7 @@ static struct pb_arm_hook arm_hooks[] = {
 	{ SYSCALL_NAME("sys_vfork"), fh_sys_vfork, &real_sys_vfork },
 	{ SYSCALL_NAME("sys_clone"), fh_sys_clone, &real_sys_clone },
 	{ SYSCALL_NAME("sys_clone3"), fh_sys_clone3, &real_sys_clone3 },
-	{ "do_exit", fh_do_exit, &real_do_exit },
+	{ "exit_files", fh_exit_files, &real_exit_files },
 	{ "force_sig_fault", fh_force_sig_fault, &real_force_sig_fault },
 };
 

@@ -43,7 +43,7 @@ What changed:
 - x86_64 still uses ftrace. It was brought up through Ubuntu 24.04, kernel 6.8.0-101-generic. On 5.11 and later the module does not set `FTRACE_OPS_FL_RECURSION`, and it moves the instruction pointer with `ftrace_regs_set_instruction_pointer`.
 - arm64, Linux >= 5.10, uses kprobes. Those kernels are built with `CONFIG_DYNAMIC_FTRACE_WITH_ARGS` and not `CONFIG_DYNAMIC_FTRACE_WITH_REGS`, so the x86 ftrace redirect does not register. The kprobe jumps to the same handlers, which then run in process context.
 - The ELF loader is caught by hooking `vm_mmap_pgoff`, not only the `mmap` syscall. Dumps go through `copy_from_user` and `kernel_write`. There is no `stac`/`clac`.
-- A list lock keeps a multithreaded unpacker from oopsing. Tracking follows the tgid, so a `prctl` rename and a child stay watched. `fork`, `vfork`, `clone`, `clone3`, and `do_exit` maintain that list.
+- A list lock keeps a multithreaded unpacker from oopsing. Tracking follows the tgid, so a `prctl` rename and a child stay watched. `fork`, `vfork`, `clone`, `clone3`, and `exit_files` maintain that list. A child is keyed on its global tgid, so a target in a container is followed too. A forked child gets a copy of the parent's records, unless it has already exec'd, as after `vfork` or `posix_spawn`. After the copy, or an exec, the child's faults are matched only against its own records.
 - A successful `execve` or `execveat` of a matching path starts tracking. A failed exec does not drop the list.
 - `pkey_mprotect` and `mremap` are hooked, so a protection-key toggle and a moved mapping are dumped at the address the code actually runs from.
 - Anonymous W^X mappings are the only ones forced with `MAP_POPULATE`. On arm64 the fault class comes from the ESR, and a tagged fault address is untagged before the page is looked up. `PROT_BTI` and `PROT_MTE` are tested as bits, not as an exact `prot` value. MTE itself is not exercised: the Raspberry Pi 4 has none.
@@ -137,7 +137,7 @@ insmod pagedrop.ko path=sigsegv.out
 ./sigsegv.out
 ```
 
-`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. The first read of an armed page from a tracked executable page is dumped, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump.
+`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. The first read of an armed page from a tracked executable page is dumped, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump. The `tgid` is the one the host sees, not the one inside a container's pid namespace. Whitespace and control bytes in `comm` are written as `_`, so every line has five fields.
 
 The armed page is restored to its previous protection after that read and is not armed again, so each armed page is traced once for the life of the process rather than once per handler epoch. A later handler epoch that reads the same address is not seen. `munmap`, a replacing `mmap`, or an `mprotect` over the data page clears the record and the page is traced again.
 
@@ -189,6 +189,8 @@ To remove the LKM, run:
 ```sh
 rmmod pagedrop.ko
 ```
+
+Unload only after every target has exited. `rmmod` removes the hooks, but it cannot restore protections inside a process that is still running. A W^X page keeps `PROT_WRITE` cleared, so the target's next write to it is a `SIGSEGV`, and unloading the module kills the process under analysis. A page armed by `data=` is the exception: while one is still `PROT_NONE`, the module holds a reference to itself and `rmmod` fails with `EBUSY`. That reference is dropped asynchronously, so an `rmmod` right after a target exits may need a retry.
 
 Quickly test in QEMU
 --------------------
