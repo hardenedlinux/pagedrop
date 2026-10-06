@@ -255,6 +255,11 @@ static int do_regs(void)
 		ret = (long)x0;
 		after = x2;
 	}
+#else
+	/* The module and this check cover x86_64 and arm64 only. */
+	(void)prot;
+	fprintf(stderr, "regs: no raw syscall for this arch\n");
+	return 1;
 #endif
 	if (ret != 0) {
 		fprintf(stderr, "regs: mprotect returned %ld\n", ret);
