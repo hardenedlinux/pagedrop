@@ -113,6 +113,12 @@ static DEFINE_MUTEX(marea_lock);
  * CONFIG_PROVE_LOCKING, on 5.10 arm64 and 7.0 x86, records
  * pb_vm_lock -> mmap_lock and no edge from an mm lock into this lock or
  * marea_lock.
+ *
+ * The hooks take it with mutex_lock_killable and return -EINTR if that
+ * fails, which happens only with a fatal signal pending. mprotect, mmap,
+ * munmap and mremap return -EINTR in that case themselves, from
+ * mmap_write_lock_killable, on 5.10 and on 7.0. So it adds no errno, and
+ * the task dies before user space could see it.
  */
 static DEFINE_MUTEX(pb_vm_lock);
 static unsigned long epoch_counter;
