@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -22,7 +23,12 @@
 #define READ_DATA 0x260000000UL
 #define READ_CODE 0x261000000UL
 #define MOVED_ADDR 0x270000000UL
+#define WX_ADDR 0x220000000UL
 #define TAG_BYTE 0x5aUL
+
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
 
 static sigjmp_buf fault_env;
 static volatile int faulted;
@@ -203,6 +209,67 @@ static int do_flip(void)
 		return 1;
 	}
 	printf("flip ok\n");
+	return 0;
+}
+
+/*
+ * A raw mprotect(RWX) must hand back the prot register unchanged. The
+ * module clears PROT_WRITE in the request, and once did it in the
+ * caller's saved registers, which the syscall ABI preserves.
+ */
+static int do_regs(void)
+{
+	unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+	unsigned long after;
+	long ret;
+	void *p;
+
+	p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("regs mmap");
+		return 1;
+	}
+#if defined(__x86_64__)
+	{
+		register unsigned long rdx asm("rdx") = prot;
+		long rax = SYS_mprotect;
+
+		asm volatile("syscall"
+			     : "+a"(rax), "+r"(rdx)
+			     : "D"(p), "S"((unsigned long)PAGE)
+			     : "rcx", "r11", "memory");
+		ret = rax;
+		after = rdx;
+	}
+#elif defined(__aarch64__)
+	{
+		register unsigned long x0 asm("x0") = (unsigned long)p;
+		register unsigned long x1 asm("x1") = PAGE;
+		register unsigned long x2 asm("x2") = prot;
+		register unsigned long x8 asm("x8") = SYS_mprotect;
+
+		asm volatile("svc #0"
+			     : "+r"(x0), "+r"(x2)
+			     : "r"(x1), "r"(x8)
+			     : "memory");
+		ret = (long)x0;
+		after = x2;
+	}
+#else
+	/* The module and this check cover x86_64 and arm64 only. */
+	(void)prot;
+	fprintf(stderr, "regs: no raw syscall for this arch\n");
+	return 1;
+#endif
+	if (ret != 0) {
+		fprintf(stderr, "regs: mprotect returned %ld\n", ret);
+		return 1;
+	}
+	if (after != prot) {
+		fprintf(stderr, "regs: prot register %#lx, want %#lx\n", after, prot);
+		return 1;
+	}
+	printf("regs ok\n");
 	return 0;
 }
 
@@ -907,10 +974,65 @@ static int do_pin(void)
 	(void)x;
 	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
 		return 1;
+	/*
+	 * The data page is armed now. Tell the suite, which reads the module
+	 * refcount before any process exits: every exit runs the exit_files
+	 * hook, which also updates the pin and would hide a pin not taken here.
+	 */
+	printf("armed\n");
+	fflush(stdout);
 	/* Hold the page inaccessible. Reading it here would restore the
 	 * protection and release the pin, which is the other case. */
 	usleep(1500000);
 	printf("pin ok\n");
+	return 0;
+}
+
+/*
+ * Run with data=260000000-280000000. Two armed pages, the first read so it
+ * is restored, the second still PROT_NONE. An MREMAP_FIXED move into the
+ * range that also shrinks to one page drops the second page's record after
+ * the move, in pb_armed_after_move. No page is PROT_NONE after that, so the
+ * pin must go. The process stays alive and the suite starts nothing that
+ * exits while it watches the refcount, so only that path can release it.
+ */
+static int do_pinmove(void)
+{
+	unsigned char *src;
+	unsigned char *code;
+	unsigned char *moved;
+
+	src = mmap((void *)READ_DATA, 2 * PAGE, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	code = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || code == MAP_FAILED) {
+		perror("pinmove mmap");
+		return 1;
+	}
+	memcpy(src, "BYTECODE", 8);
+	memcpy(src + PAGE, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("pinmove rx");
+		return 1;
+	}
+	if (*(volatile unsigned char *)src != 'B') {
+		fprintf(stderr, "pinmove: first page lost its bytes\n");
+		return 1;
+	}
+	moved = mremap(src, 2 * PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED,
+		       (void *)MOVED_ADDR);
+	if (moved == MAP_FAILED) {
+		perror("pinmove mremap");
+		return 1;
+	}
+	if (moved[0] != 'B') {
+		fprintf(stderr, "pinmove: moved page lost its bytes\n");
+		return 1;
+	}
+	printf("moved\n");
+	fflush(stdout);
+	usleep(3000000);
+	printf("pinmove ok\n");
 	return 0;
 }
 
@@ -1442,6 +1564,589 @@ static int do_tag(void)
 }
 #endif
 
+/*
+ * MREMAP_DONTUNMAP moves the page and leaves the source mapped, with its
+ * protection. An armed source must not be left PROT_NONE with its record
+ * gone to the destination: both ends have to read without a fault.
+ */
+/*
+ * Run with data=260000000-280000000, so the source and the destination are
+ * both armed. MREMAP_FIXED|MREMAP_DONTUNMAP is valid on 5.10 and 7.0 when
+ * the size does not change: the page moves to the fixed address and the
+ * source stays mapped. Both ends must then read without a fault, and the
+ * moved page must keep its bytes.
+ */
+static int do_fixeddontunmap(void)
+{
+	unsigned char *data;
+	unsigned char *dst;
+	unsigned char *code;
+	unsigned char *moved;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	dst = map_fixed(MOVED_ADDR, PROT_READ | PROT_WRITE);
+	code = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (!data || !dst || code == MAP_FAILED) {
+		perror("fixeddontunmap mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("fixeddontunmap rx");
+		return 1;
+	}
+	moved = mremap(data, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+		       dst);
+	if (moved == MAP_FAILED) {
+		perror("fixeddontunmap mremap");
+		return 1;
+	}
+	if (moved != dst) {
+		fprintf(stderr, "fixeddontunmap: page not at the fixed address\n");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = moved[0];
+
+		if (x != 'B') {
+			fprintf(stderr, "fixeddontunmap: moved page lost its bytes\n");
+			return 1;
+		}
+	}
+	if (faulted) {
+		fprintf(stderr, "fixeddontunmap: fault on the moved page\n");
+		return 1;
+	}
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = data[0];
+
+		(void)x;
+	}
+	if (faulted) {
+		fprintf(stderr, "fixeddontunmap: fault on the source\n");
+		return 1;
+	}
+	printf("fixeddontunmap ok\n");
+	return 0;
+}
+
+static int do_dontunmap(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	unsigned char *moved;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("dontunmap mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("dontunmap rx");
+		return 1;
+	}
+	moved = mremap(data, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, NULL);
+	if (moved == MAP_FAILED) {
+		perror("dontunmap mremap");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = moved[0];
+
+		if (x != 'B') {
+			fprintf(stderr, "dontunmap: moved page lost its bytes\n");
+			return 1;
+		}
+	}
+	if (faulted) {
+		fprintf(stderr, "dontunmap: fault on the moved page\n");
+		return 1;
+	}
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = data[0];
+
+		(void)x;
+	}
+	if (faulted) {
+		fprintf(stderr, "dontunmap: fault on the source\n");
+		return 1;
+	}
+	printf("dontunmap ok\n");
+	return 0;
+}
+
+/*
+ * Run after vfork and exec by do_execguard. The new image makes its own
+ * PROT_NONE page at the address the parent armed, and its own handler must
+ * see the fault. The module must not restore the page from the parent's
+ * record, nor from a copy of it. The sleep lets the parent's fork
+ * bookkeeping finish first.
+ */
+static int do_guard_child(void)
+{
+	unsigned char *p;
+
+	usleep(100000);
+	p = map_fixed(READ_DATA, PROT_NONE);
+	if (!p) {
+		perror("guardchild mmap");
+		return 2;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = p[0];
+
+		(void)x;
+	}
+	if (!faulted) {
+		fprintf(stderr, "execguard: the child's guard page was readable\n");
+		return 1;
+	}
+	return 0;
+}
+
+static int do_execguard(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pid_t pid;
+	int st;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("execguard mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("execguard rx");
+		return 1;
+	}
+	pid = vfork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		execl("/proc/self/exe", "guardchild", (char *)NULL);
+		_exit(3);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		fprintf(stderr, "execguard: child status %#x\n", st);
+		return 1;
+	}
+	printf("execguard ok\n");
+	return 0;
+}
+
+/*
+ * A comm with a space and a newline, then a dump. The index line must
+ * still be one line of five fields; run_tests.sh checks it.
+ */
+static int do_commname(void)
+{
+	unsigned char *p;
+
+	if (prctl(PR_SET_NAME, "ex tra\nx", 0, 0, 0) != 0) {
+		perror("commname prctl");
+		return 1;
+	}
+	p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("commname mmap");
+		return 1;
+	}
+	memcpy(p + 16, "COMMNAME", 8);
+	if (mprotect(p, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("commname rx");
+		return 1;
+	}
+	if (!dump_exact(0, "COMMNAME")) {
+		fprintf(stderr, "commname: marker not dumped\n");
+		return 1;
+	}
+	printf("commname ok\n");
+	return 0;
+}
+
+/*
+ * A store to code that was only ever read-execute is the program's own
+ * fault and must reach its handler. The module once stripped exec from
+ * the page, left it read-only, and swallowed the fault, so the store
+ * faulted again forever. alarm() turns that into a failure.
+ */
+static int do_rowrite(void)
+{
+	unsigned char *p;
+
+	p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("rowrite mmap");
+		return 1;
+	}
+	memcpy(p + 16, "ROWRITE!", 8);
+	if (mprotect(p, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("rowrite rx");
+		return 1;
+	}
+	arm_fault();
+	alarm(3);
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)p = 1;
+	alarm(0);
+	if (!faulted) {
+		fprintf(stderr, "rowrite: store to read-execute page succeeded\n");
+		return 1;
+	}
+	printf("rowrite ok\n");
+	return 0;
+}
+
+/*
+ * The window before the parent copies its records into a fork child,
+ * made deterministic: after vfork the parent only runs pb_note_child once
+ * the child has exited. The child stores to the parent's RWX page, which
+ * the module keeps read-execute. That fault is the module's, so the child
+ * must not get a SIGSEGV. vfork shares the memory, so the parent sees the
+ * store.
+ */
+/*
+ * Run with data=260000000-260001000. A vfork child stays in its copy window
+ * for its whole life: the parent runs pb_note_child only once the child has
+ * exited. A child forked inside that window must get the records of the
+ * nearest ancestor that owns them, here the vfork parent, not the empty set
+ * of its own parent. The grandchild reads the armed page, and without those
+ * records the read is a real SIGSEGV.
+ */
+static int do_vforkfork(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pid_t pid;
+	int st;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("vforkfork mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("vforkfork rx");
+		return 1;
+	}
+	pid = vfork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		long c;
+		int cst;
+
+		/*
+		 * Any hooked call lists this child, as a child of a tracked
+		 * process that does not own its records yet. munmap of an
+		 * unmapped range changes nothing in the shared mm.
+		 */
+		munmap((void *)0x2b0000000UL, PAGE);
+		c = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+		if (c == 0)
+			_exit(*(volatile unsigned char *)data == 'B' ? 0 : 2);
+		if (c < 0)
+			_exit(3);
+		if (waitpid(c, &cst, 0) < 0)
+			_exit(4);
+		if (WIFSIGNALED(cst))
+			_exit(100 + WTERMSIG(cst));
+		_exit(WIFEXITED(cst) ? WEXITSTATUS(cst) : 5);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		if (WIFEXITED(st) && WEXITSTATUS(st) > 100)
+			fprintf(stderr, "vforkfork: grandchild killed by signal %d\n",
+				WEXITSTATUS(st) - 100);
+		else
+			fprintf(stderr, "vforkfork: status %#x\n", st);
+		return 1;
+	}
+	printf("vforkfork ok\n");
+	return 0;
+}
+
+static int do_vforkwrite(void)
+{
+	unsigned char *p;
+	pid_t pid;
+	int st;
+
+	p = map_fixed(WX_ADDR, PROT_READ | PROT_WRITE | PROT_EXEC);
+	if (!p) {
+		perror("vforkwrite mmap");
+		return 1;
+	}
+	pid = vfork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		*(volatile unsigned char *)p = 0x42;
+		_exit(0);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		fprintf(stderr, "vforkwrite: child status %#x\n", st);
+		return 1;
+	}
+	if (p[0] != 0x42) {
+		fprintf(stderr, "vforkwrite: store not visible\n");
+		return 1;
+	}
+	printf("vforkwrite ok\n");
+	return 0;
+}
+
+/*
+ * MAP_FIXED with RWX over an armed data page. The armed record belongs to
+ * the old mapping. If it survives, a store to the new page is taken for a
+ * read of armed data: its old protection is restored and a trace line is
+ * written. The store must be handled as a W^X write, with no trace line.
+ */
+static int do_fixedwx(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("fixedwx mmap");
+		return 1;
+	}
+	memcpy(data, "OLDDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("fixedwx rx");
+		return 1;
+	}
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE | PROT_EXEC);
+	if (!data) {
+		perror("fixedwx remap");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)data = 1;
+	if (faulted) {
+		fprintf(stderr, "fixedwx: store to the new RWX page faulted\n");
+		return 1;
+	}
+	if (trace_has(READ_DATA)) {
+		fprintf(stderr, "fixedwx: the old armed record handled the store\n");
+		return 1;
+	}
+	printf("fixedwx ok\n");
+	return 0;
+}
+
+/*
+ * Make wx an RWX page again. The module keeps it read-execute, with a
+ * record that allows the next store, as right after mmap.
+ */
+static int badprot_rearm(unsigned char *wx)
+{
+	if (mprotect(wx, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+		perror("badprot rwx");
+		return 1;
+	}
+	return 0;
+}
+
+static int badprot_store(unsigned char *wx, const char *what)
+{
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)wx = 1;
+	if (faulted) {
+		fprintf(stderr, "badprot: store to the RWX page faulted after %s\n", what);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * A failed mprotect must leave the module's records as they were. The
+ * prot bit 0x8000 is invalid on x86_64 and arm64, and pkey 15 is never
+ * allocated here, so these calls fail with EINVAL before any VMA is
+ * touched. arm64 before 6.12 has no pkeys, and pkey_mprotect fails with
+ * ENOSYS instead. A W^X page the module keeps read-execute must still take a
+ * store after each of them, including the ones that ask for exactly the
+ * read-execute protection the page already has. And a failed
+ * mprotect(RWX) of a read-write page must not let the module make it
+ * executable.
+ */
+static int do_badprot(void)
+{
+	unsigned char *wx;
+	unsigned char *rw;
+
+	wx = mmap(NULL, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	rw = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (wx == MAP_FAILED || rw == MAP_FAILED) {
+		perror("badprot mmap");
+		return 1;
+	}
+	if (mprotect(wx, PAGE, PROT_READ | 0x8000) == 0 || errno != EINVAL) {
+		fprintf(stderr, "badprot: mprotect did not fail with EINVAL\n");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)wx = 1;
+	if (faulted) {
+		fprintf(stderr, "badprot: store to the RWX page faulted\n");
+		return 1;
+	}
+	if (badprot_rearm(wx))
+		return 1;
+	if (mprotect(wx, PAGE, PROT_READ | PROT_EXEC | 0x8000) == 0 || errno != EINVAL) {
+		fprintf(stderr, "badprot: mprotect(RX|0x8000) did not fail with EINVAL\n");
+		return 1;
+	}
+	if (badprot_store(wx, "a failed mprotect(RX)"))
+		return 1;
+	if (badprot_rearm(wx))
+		return 1;
+	if (syscall(SYS_pkey_mprotect, wx, PAGE, PROT_READ | PROT_EXEC, 15) == 0) {
+		fprintf(stderr, "badprot: pkey_mprotect with pkey 15 succeeded\n");
+		return 1;
+	}
+	if (badprot_store(wx, "a failed pkey_mprotect(RX)"))
+		return 1;
+	plant(rw, "BADPROT!");
+	if (mprotect(rw, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC | 0x8000) == 0 ||
+	    errno != EINVAL) {
+		fprintf(stderr, "badprot: mprotect(RWX) did not fail with EINVAL\n");
+		return 1;
+	}
+	if (call_ok(rw)) {
+		fprintf(stderr, "badprot: a read-write page ran\n");
+		return 1;
+	}
+	printf("badprot ok\n");
+	return 0;
+}
+
+/*
+ * Run with data=260000000-280000000, so the source and the destination
+ * are both armed. The source is read-only, the destination read-write.
+ * After MREMAP_FIXED moves the source over the destination, only the
+ * source's record may describe that address: a read must work and a store
+ * must fault. A surviving destination record would restore read-write.
+ */
+static int do_fixedover(void)
+{
+	unsigned char *src;
+	unsigned char *dst;
+	unsigned char *code;
+	unsigned char *moved;
+
+	src = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	dst = map_fixed(MOVED_ADDR, PROT_READ | PROT_WRITE);
+	code = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (!src || !dst || code == MAP_FAILED) {
+		perror("fixedover mmap");
+		return 1;
+	}
+	memcpy(src, "BYTECODE", 8);
+	if (mprotect(src, PAGE, PROT_READ) != 0) {
+		perror("fixedover ro");
+		return 1;
+	}
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("fixedover rx");
+		return 1;
+	}
+	moved = mremap(src, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+	if (moved == MAP_FAILED) {
+		perror("fixedover mremap");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = moved[0];
+
+		if (x != 'B') {
+			fprintf(stderr, "fixedover: moved page lost its bytes\n");
+			return 1;
+		}
+	}
+	if (faulted) {
+		fprintf(stderr, "fixedover: read of the moved page faulted\n");
+		return 1;
+	}
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)moved = 1;
+	if (!faulted) {
+		fprintf(stderr, "fixedover: store to the read-only page succeeded\n");
+		return 1;
+	}
+	printf("fixedover ok\n");
+	return 0;
+}
+
+/*
+ * An mprotect that fails part way still applies what came before the
+ * failure. Here an RWX page, which the module keeps read-execute, is
+ * followed by a hole. mprotect(RX) over both applies RX to the page, a
+ * no-op for its VMA, then fails on the hole with ENOMEM. The program has
+ * forbidden writes to the page, so a store must fault. The module must not
+ * put back the RWX record it had before the call.
+ */
+static int do_partial(void)
+{
+	unsigned char *p;
+
+	p = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE | PROT_EXEC,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("partial mmap");
+		return 1;
+	}
+	if (munmap(p + PAGE, PAGE) != 0) {
+		perror("partial munmap");
+		return 1;
+	}
+	if (mprotect(p, 2 * PAGE, PROT_READ | PROT_EXEC) == 0 || errno != ENOMEM) {
+		fprintf(stderr, "partial: mprotect did not fail with ENOMEM\n");
+		return 1;
+	}
+	arm_fault();
+	alarm(3);
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		*(volatile unsigned char *)p = 1;
+	alarm(0);
+	if (!faulted) {
+		fprintf(stderr, "partial: store allowed after RX was applied\n");
+		return 1;
+	}
+	printf("partial ok\n");
+	return 0;
+}
+
 static int is_named(const char *argv0, const char *name)
 {
 	const char *base = strrchr(argv0, '/');
@@ -1493,12 +2198,16 @@ int main(int argc, char **argv)
 		return do_payload();
 	if (is_named(argv[0], "stalehelper"))
 		return do_stale_helper();
+	if (is_named(argv[0], "guardchild"))
+		return do_guard_child();
 	if (argc < 2)
 		return 2;
 	if (!strcmp(argv[1], "epoch"))
 		return do_epoch();
 	if (!strcmp(argv[1], "flip"))
 		return do_flip();
+	if (!strcmp(argv[1], "regs"))
+		return do_regs();
 	if (!strcmp(argv[1], "fail"))
 		return do_fail();
 	if (!strcmp(argv[1], "read"))
@@ -1525,6 +2234,8 @@ int main(int argc, char **argv)
 		return do_maymove();
 	if (!strcmp(argv[1], "pin"))
 		return do_pin();
+	if (!strcmp(argv[1], "pinmove"))
+		return do_pinmove();
 	if (!strcmp(argv[1], "roarm"))
 		return do_roarm();
 	if (!strcmp(argv[1], "moveread"))
@@ -1545,6 +2256,28 @@ int main(int argc, char **argv)
 		return do_noneexec();
 	if (!strcmp(argv[1], "disarm"))
 		return do_disarm();
+	if (!strcmp(argv[1], "vforkwrite"))
+		return do_vforkwrite();
+	if (!strcmp(argv[1], "vforkfork"))
+		return do_vforkfork();
+	if (!strcmp(argv[1], "fixedover"))
+		return do_fixedover();
+	if (!strcmp(argv[1], "partial"))
+		return do_partial();
+	if (!strcmp(argv[1], "badprot"))
+		return do_badprot();
+	if (!strcmp(argv[1], "fixedwx"))
+		return do_fixedwx();
+	if (!strcmp(argv[1], "rowrite"))
+		return do_rowrite();
+	if (!strcmp(argv[1], "commname"))
+		return do_commname();
+	if (!strcmp(argv[1], "dontunmap"))
+		return do_dontunmap();
+	if (!strcmp(argv[1], "fixeddontunmap"))
+		return do_fixeddontunmap();
+	if (!strcmp(argv[1], "execguard"))
+		return do_execguard();
 	if (!strcmp(argv[1], "stale"))
 		return do_stale();
 	if (!strcmp(argv[1], "execve"))
@@ -1557,6 +2290,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|fail|read|forkread|forkrace|pin|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|vforkfork|fixedwx|badprot|partial|fixedover|commname|dontunmap|fixeddontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }
