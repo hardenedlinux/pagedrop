@@ -365,6 +365,13 @@ load path=extra data=260000000-260001000
 ./userland/c/extra dontunmap
 mark "$?" "dontunmap"
 
+say "fixeddontunmap"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-280000000
+./userland/c/extra fixeddontunmap
+mark "$?" "fixeddontunmap"
+
 say "execguard"
 unload
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace

@@ -1564,6 +1564,69 @@ static int do_tag(void)
  * protection. An armed source must not be left PROT_NONE with its record
  * gone to the destination: both ends have to read without a fault.
  */
+/*
+ * Run with data=260000000-280000000, so the source and the destination are
+ * both armed. MREMAP_FIXED|MREMAP_DONTUNMAP is valid on 5.10 and 7.0 when
+ * the size does not change: the page moves to the fixed address and the
+ * source stays mapped. Both ends must then read without a fault, and the
+ * moved page must keep its bytes.
+ */
+static int do_fixeddontunmap(void)
+{
+	unsigned char *data;
+	unsigned char *dst;
+	unsigned char *code;
+	unsigned char *moved;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	dst = map_fixed(MOVED_ADDR, PROT_READ | PROT_WRITE);
+	code = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (!data || !dst || code == MAP_FAILED) {
+		perror("fixeddontunmap mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("fixeddontunmap rx");
+		return 1;
+	}
+	moved = mremap(data, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP,
+		       dst);
+	if (moved == MAP_FAILED) {
+		perror("fixeddontunmap mremap");
+		return 1;
+	}
+	if (moved != dst) {
+		fprintf(stderr, "fixeddontunmap: page not at the fixed address\n");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = moved[0];
+
+		if (x != 'B') {
+			fprintf(stderr, "fixeddontunmap: moved page lost its bytes\n");
+			return 1;
+		}
+	}
+	if (faulted) {
+		fprintf(stderr, "fixeddontunmap: fault on the moved page\n");
+		return 1;
+	}
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = data[0];
+
+		(void)x;
+	}
+	if (faulted) {
+		fprintf(stderr, "fixeddontunmap: fault on the source\n");
+		return 1;
+	}
+	printf("fixeddontunmap ok\n");
+	return 0;
+}
+
 static int do_dontunmap(void)
 {
 	unsigned char *data;
@@ -2140,6 +2203,8 @@ int main(int argc, char **argv)
 		return do_commname();
 	if (!strcmp(argv[1], "dontunmap"))
 		return do_dontunmap();
+	if (!strcmp(argv[1], "fixeddontunmap"))
+		return do_fixeddontunmap();
 	if (!strcmp(argv[1], "execguard"))
 		return do_execguard();
 	if (!strcmp(argv[1], "stale"))
@@ -2154,6 +2219,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|fixedwx|badprot|partial|fixedover|commname|dontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|fixedwx|badprot|partial|fixedover|commname|dontunmap|fixeddontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }

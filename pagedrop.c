@@ -1783,6 +1783,13 @@ static long pb_mremap(struct pt_regs *regs)
 		 * accessible, and the moved page is re-armed by the next
 		 * executable mprotect. DONTUNMAP always moves, even at the
 		 * same size, so the size test below does not apply to it.
+		 *
+		 * With MREMAP_FIXED as well, both release loops run, and that
+		 * is a valid call on 5.10 and 7.0 if the size does not change:
+		 * the kernel unmaps the destination and keeps the source. If
+		 * it rejects the call instead, for a size change or an overlap,
+		 * the pages released here are only accessible, and the next
+		 * executable mprotect arms them again.
 		 */
 		for (i = 0; i < n_pages; i++)
 			pb_release_armed(tgid, old + (unsigned long)i * PAGE_SIZE);
