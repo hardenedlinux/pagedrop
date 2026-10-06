@@ -2175,6 +2175,17 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	if (!pb_is_target() || sig != SIGSEGV)
 		return real_force_sig_fault(sig, code, addr);
 
+	/*
+	 * A protection-key fault is not about the page's protection, and
+	 * mprotect keeps the key, so the access would fault again: on an
+	 * armed data page as much as on a tracked code page. Check it before
+	 * either handler, or a restore would just loop. Neither arch sends a
+	 * pkey fault through force_sig_fault on 6.18 or 7.0, so this is
+	 * defensive.
+	 */
+	if (code == SEGV_PKUERR)
+		return real_force_sig_fault(sig, code, addr);
+
 	if (data_on && (pb_fault_is_read() || pb_fault_is_write()) &&
 	    pb_handle_data(address))
 		return 0;
@@ -2182,12 +2193,6 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	if (!pb_take_page(address, &page_addr, &new_prot))
 		return real_force_sig_fault(sig, code, addr);
 
-	/*
-	 * A protection-key fault is not about the page's protection, and
-	 * mprotect keeps the key, so the access would fault again.
-	 */
-	if (code == SEGV_PKUERR)
-		return real_force_sig_fault(sig, code, addr);
 	/*
 	 * Only a write the module forbade, by clearing PROT_WRITE from a W+X
 	 * request, is ours to allow. A tracked page whose saved prot has no
