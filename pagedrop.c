@@ -1114,8 +1114,22 @@ static bool pb_armed_claim(pid_t tgid, unsigned long page, unsigned long prot)
 		}
 	}
 	seen = new_marea(tgid, page, prot);
-	if (seen)
+	if (seen) {
 		list_add(&seen->list, &data_armed);
+		/*
+		 * Take the pin here, before the caller sets PROT_NONE. Nothing
+		 * else on the arming path updates it. Every process exit
+		 * does, through the exit_files hook, and that hid the gap in
+		 * testing. If the module is already going away the pin cannot
+		 * be taken, so the page is not armed.
+		 */
+		pb_pin_update_locked();
+		if (!pb_pin_held) {
+			list_del(&seen->list);
+			kfree(seen);
+			seen = NULL;
+		}
+	}
 	mutex_unlock(&marea_lock);
 	return seen != NULL;
 }
@@ -1594,6 +1608,11 @@ static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, 
 		}
 		break;
 	}
+	/*
+	 * A dropped record may have been the last page still PROT_NONE. Let
+	 * the pin go, or rmmod is refused until some unrelated update.
+	 */
+	pb_pin_update_locked();
 	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
 		if (entry->tgid != tgid || entry->addr != from)
 			continue;

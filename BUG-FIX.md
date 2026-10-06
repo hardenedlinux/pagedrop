@@ -265,7 +265,7 @@ The W^X rewrite cleared `PROT_WRITE` with `pb_set_arg(regs, 2, ...)` on the `pt_
 
 Fix: `fh_sys_mprotect` and `fh_sys_pkey_mprotect` copy `pt_regs` and pass the copy to the real syscall. `pb_mprotect` and the fault path already built their own `pt_regs`.
 
-`extra regs` issues a raw `mprotect(RWX)` and requires the register to come back unchanged. It is in both suites. It passes on x86 with the module unloaded. It has not yet been run with the module loaded on either arch. Both modules compile: x86 against 6.18 with `-Werror`, arm64 against a 6.18 `defconfig` tree, compile only.
+`extra regs` issues a raw `mprotect(RWX)` and requires the register to come back unchanged. It is in both suites. It passes on x86 with the module unloaded, and with the module loaded on arm64 and x86 (see "Loaded-module runs"). Both modules also compile: x86 against 6.18 with `-Werror`, arm64 against a 6.18 `defconfig` tree, compile only.
 
 ## A vfork child got the parent's records after its exec
 
@@ -397,8 +397,22 @@ Found by `extra badprot` on an Orange Pi 3B, kernel 5.10.160 with `CONFIG_KPROBE
 
 Fix: `pb_protect_done` returns `start` for `-ENOSYS`, so every page gets its old record back. `extra badprot` passes.
 
+## Arming did not take the pin, and a moved-away record did not release it
+
+The unload entry above says the pin is taken before `PROT_NONE` is set. It was not. `pb_armed_claim` added the record and returned, and nothing on the arming path called `pb_pin_update_locked()`. Between arming and the next update, a data page was `PROT_NONE` while `rmmod` succeeded, which is the stranding the pin exists to prevent. The other side had the same gap. When `pb_armed_after_move` dropped a record whose page left the range, or fell off the end of a shrinking move, it did not update the pin. If that was the last page still `PROT_NONE`, the pin stayed and `rmmod` was refused until some unrelated update.
+
+Found by the maintainer's review of PR #1, which traced every caller and concluded that `extra pin` could not pass. Yet it passed on both arches. An ftrace of `pb_pin_update_locked` with `func_stack_trace` on the arm64 board shows why. Arming at `pb_arm_range <- pb_try_arm <- pb_protect_syscall` is followed by no update from the target. The next one is `pb_drop_data_state <- fh_exit_files <- do_exit` in the `sleep` process: the suite's own `sleep 1`, exiting just before its `rmmod`. The `exit_files` hook runs for every process that exits, and the pin is global, so any exit anywhere took the missing pin. On a busy machine the window is short, but it is there.
+
+Fix: `pb_armed_claim` calls `pb_pin_update_locked()` right after `list_add`, before the caller sets `PROT_NONE`. If the pin cannot be taken because the module is already going away, the record is dropped and the page is not armed. `pb_armed_after_move` calls `pb_pin_update_locked()` after it settles the record.
+
+The tests now avoid the exit that hid this. `extra pin` prints `armed` once the page is armed. The suite reads that from a FIFO and reads `/sys/module/pagedrop/refcnt` with shell builtins only, so no process exits in between. `extra pinmove`, with `data=260000000-280000000`, arms two pages, reads the first, then shrinks the pair to one page with an `MREMAP_FIXED` move inside the range. The second page's record is dropped in `pb_armed_after_move`. With `extra` still alive and nothing exiting, the suite requires the refcount to reach 0 within a second. Before the fix, on both arches: `pin` saw refcount 0 after arming, and `pinmove` still saw 1 after the move, so both failed. After the fix both pass.
+
+The run scripts also stopped trusting `rmmod` and `insmod`. Each test used `sudo rmmod pagedrop 2>/dev/null || true` and an unchecked `insmod`. A pinned module made `rmmod` fail, `insmod` then failed with `EEXIST`, and the test ran on the previous module with the previous `path=` and `data=`. `unload` now retries `rmmod` for 10 seconds, `load` checks `insmod`, and the suite stops if either one fails.
+
 ## Loaded-module runs
 
-arm64 has now been run with the module loaded: Orange Pi 3B (RK3566), Ubuntu 22.04, kernel 5.10.160-rockchip-rk356x rebuilt with `CONFIG_KPROBES=y`, UPX 5.0.2. `tools/arm64/run_tests.sh` passed all 59 checks, `badprot`, `partial`, `fixedover` and `pin` included, with no oops or warning in `dmesg`. x86 has been run too: Ubuntu 26.04.1, kernel 7.0.0-30-generic, ftrace, gcc 15.2.0, UPX 4.2.4, bare metal. `tools/x86/run_tests.sh` passed all 57 checks, with no oops or warning in `dmesg`.
+arm64 has now been run with the module loaded: Orange Pi 3B (RK3566), Ubuntu 22.04, kernel 5.10.160-rockchip-rk356x rebuilt with `CONFIG_KPROBES=y`, UPX 5.0.2. `tools/arm64/run_tests.sh` passed all 60 checks, `badprot`, `partial`, `fixedover`, `pin` and `pinmove` included, with no oops or warning in `dmesg`. x86 has been run too: Ubuntu 26.04.1, kernel 7.0.0-38-generic, ftrace, gcc 15.2.0, UPX 4.2.4, bare metal. `tools/x86/run_tests.sh` passed all 58 checks, with no oops or warning in `dmesg`.
+
+An earlier round reported 59 and 57. Its `pin` pass was not real: the pin came from the suite's own `sleep` exiting, as the entry on arming and the pin explains. The counts above are from the suites that read the refcount before any exit.
 
 Every fix in the entries from the `do_exit` race onwards was checked by compiling: x86 against 6.18 with `-Werror`, and arm64 against a 6.18 `defconfig` tree, object only. The paths from all three external review rounds were also checked with its isolated harness, which compiles the module's functions against stubs, with the expectations reversed. All eleven scenarios, from three rounds, now report the fixed behaviour, the concurrent one with a real mutex and a second thread. Both suites have now passed with the module loaded, so these fixes count as verified on x86 and arm64.

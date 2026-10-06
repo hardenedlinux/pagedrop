@@ -969,10 +969,65 @@ static int do_pin(void)
 	(void)x;
 	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
 		return 1;
+	/*
+	 * The data page is armed now. Tell the suite, which reads the module
+	 * refcount before any process exits: every exit runs the exit_files
+	 * hook, which also updates the pin and would hide a pin not taken here.
+	 */
+	printf("armed\n");
+	fflush(stdout);
 	/* Hold the page inaccessible. Reading it here would restore the
 	 * protection and release the pin, which is the other case. */
 	usleep(1500000);
 	printf("pin ok\n");
+	return 0;
+}
+
+/*
+ * Run with data=260000000-280000000. Two armed pages, the first read so it
+ * is restored, the second still PROT_NONE. An MREMAP_FIXED move into the
+ * range that also shrinks to one page drops the second page's record after
+ * the move, in pb_armed_after_move. No page is PROT_NONE after that, so the
+ * pin must go. The process stays alive and the suite starts nothing that
+ * exits while it watches the refcount, so only that path can release it.
+ */
+static int do_pinmove(void)
+{
+	unsigned char *src;
+	unsigned char *code;
+	unsigned char *moved;
+
+	src = mmap((void *)READ_DATA, 2 * PAGE, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	code = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || code == MAP_FAILED) {
+		perror("pinmove mmap");
+		return 1;
+	}
+	memcpy(src, "BYTECODE", 8);
+	memcpy(src + PAGE, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("pinmove rx");
+		return 1;
+	}
+	if (*(volatile unsigned char *)src != 'B') {
+		fprintf(stderr, "pinmove: first page lost its bytes\n");
+		return 1;
+	}
+	moved = mremap(src, 2 * PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED,
+		       (void *)MOVED_ADDR);
+	if (moved == MAP_FAILED) {
+		perror("pinmove mremap");
+		return 1;
+	}
+	if (moved[0] != 'B') {
+		fprintf(stderr, "pinmove: moved page lost its bytes\n");
+		return 1;
+	}
+	printf("moved\n");
+	fflush(stdout);
+	usleep(3000000);
+	printf("pinmove ok\n");
 	return 0;
 }
 
@@ -2047,6 +2102,8 @@ int main(int argc, char **argv)
 		return do_maymove();
 	if (!strcmp(argv[1], "pin"))
 		return do_pin();
+	if (!strcmp(argv[1], "pinmove"))
+		return do_pinmove();
 	if (!strcmp(argv[1], "roarm"))
 		return do_roarm();
 	if (!strcmp(argv[1], "moveread"))
@@ -2097,6 +2154,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|fixedwx|badprot|partial|fixedover|commname|dontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|fixedwx|badprot|partial|fixedover|commname|dontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }
