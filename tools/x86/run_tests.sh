@@ -14,10 +14,16 @@ mark() {
 	fi
 }
 
-# Every test needs a fresh module with its own parameters. A pinned module
-# makes rmmod fail for a moment, and an unchecked insmod would then fail with
-# EEXIST and leave the previous module, with the previous path= and data=,
-# under the test. Retry the unload and stop the suite if either step fails.
+# Unload, and insist it worked.
+#
+# A pinned module refuses rmmod for a moment after the last armed page is
+# released, because the release is a work item. Retry that, and if the module
+# is still loaded after ten seconds the rest of the suite would be measuring
+# the previous build with the previous path= and data=, so stop instead.
+#
+# This is the false pass AGENTS.md warns about: rmmod was allowed to fail and
+# insmod's EEXIST was ignored, so a case could print PASS while measuring the
+# module that was already loaded.
 unload() {
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
 		grep -q '^pagedrop ' /proc/modules || return 0
@@ -25,8 +31,11 @@ unload() {
 		sleep 1
 	done
 	echo "rmmod pagedrop: still loaded after 10 tries"
+	echo "the suite would measure the previous build, so stopping"
 	exit 1
 }
+
+# Load, and insist it worked.
 load() {
 	sudo insmod ./pagedrop.ko "$@" && return 0
 	echo "insmod pagedrop.ko $*: failed"
@@ -54,6 +63,9 @@ load path=simple
 hooks=$(sudo dmesg | grep 'pagedrop: hooked' | tail -13)
 	echo "$hooks"
 	missing=0
+	# exit_files replaced do_exit: testing live on entry to do_exit raced with
+	# exit_group, so two threads could each judge the other still alive and
+	# both skip the cleanup. See the comment on fh_exit_files.
 	for n in mprotect pkey_mprotect mremap munmap vm_mmap_pgoff execve execveat fork vfork clone clone3 exit_files force_sig_fault; do
 	echo "$hooks" | grep -q "$n" || { echo "missing hook $n"; missing=1; }
 done
@@ -134,12 +146,12 @@ load path=extra
 ./userland/c/extra flip
 mark "$?" "flip"
 
-say "regs"
+say "rowrite"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
 load path=extra
-./userland/c/extra regs
-mark "$?" "regs"
+./userland/c/extra rowrite
+mark "$?" "rowrite"
 
 say "commname"
 unload
@@ -147,7 +159,10 @@ sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
 load path=extra
 ./userland/c/extra commname
 mark "$?" "commname"
-python3 - << 'PY'
+# A comm containing a space or a newline must not be able to forge an index
+# row: every line has to keep exactly five fields, and the name has to come
+# through sanitised.
+python3 - << 'PYEOF'
 ok = False
 for line in open("/tmp/pagedrop.index"):
     p = line.split()
@@ -156,8 +171,15 @@ for line in open("/tmp/pagedrop.index"):
     if p[1] == "ex_tra_x" and p[4] == "mprotect":
         ok = True
 raise SystemExit(0 if ok else 1)
-PY
+PYEOF
 mark "$?" "index commname"
+
+say "dontunmap"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260001000
+./userland/c/extra dontunmap
+mark "$?" "dontunmap"
 
 say "read"
 unload
@@ -177,6 +199,13 @@ for line in open("/tmp/pagedrop.index"):
 raise SystemExit(0 if ok else 1)
 PY
 mark "$?" "index read"
+
+say "armexec"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260002000
+./userland/c/extra armexec
+mark "$?" "armexec"
 
 say "forkread"
 unload
@@ -267,58 +296,24 @@ mark "$capture_rc" "rankload capture"
 
 say "pin"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace /tmp/pbpin.fifo
-mkfifo /tmp/pbpin.fifo
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
 load path=extra data=260000000-260001000
-./userland/c/extra pin > /tmp/pbpin.fifo &
+./userland/c/extra pin &
 pinpid=$!
-exec 3< /tmp/pbpin.fifo
-ready=
-ref=
-read -r -t 5 -u 3 ready
-# Builtins only from here to the refcount read: any process that exits runs
-# the exit_files hook, which updates the pin, and would hide a pin that the
-# arming itself did not take.
-read -r ref < /sys/module/pagedrop/refcnt
-echo "pin: extra said '$ready', refcnt $ref"
-pin=1
-if [ "$ready" = armed ] && [ "${ref:-0}" -ge 1 ] && ! sudo rmmod pagedrop 2>/dev/null; then
-	pin=0
-fi
-mark "$pin" "pin"
-kill "$pinpid" 2>/dev/null
-wait "$pinpid" 2>/dev/null
-exec 3<&-
-rm -f /tmp/pbpin.fifo
-unload
-
-say "pinmove"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace /tmp/pbpin.fifo
-mkfifo /tmp/pbpin.fifo
-load path=extra data=260000000-280000000
-./userland/c/extra pinmove > /tmp/pbpin.fifo &
-pinpid=$!
-exec 3< /tmp/pbpin.fifo
-ready=
-ref=
-read -r -t 5 -u 3 ready
-# The release is asynchronous. Poll for a second with builtins only, while
-# extra is still alive and nothing exits, so only the move can release it.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-	read -r ref < /sys/module/pagedrop/refcnt
-	[ "$ref" = 0 ] && break
-	read -r -t 0.1 -u 3 _ || true
-done
-echo "pinmove: extra said '$ready', refcnt $ref"
-if [ "$ready" = moved ] && [ "$ref" = 0 ]; then
-	mark 0 "pinmove"
+sleep 1
+if sudo rmmod pagedrop 2>/dev/null; then
+	mark 1 "pin"
 else
-	mark 1 "pinmove"
+	mark 0 "pin"
 fi
 kill "$pinpid" 2>/dev/null
 wait "$pinpid" 2>/dev/null
-exec 3<&-
-rm -f /tmp/pbpin.fifo
+# The unpin is asynchronous, so rmmod can fail for a moment after the last
+# armed page goes away. Poll rather than assume it has already happened.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	sudo rmmod pagedrop 2>/dev/null && break
+	sleep 1
+done
 
 say "pinoff"
 unload
@@ -357,75 +352,26 @@ load path=extra data=260000000-280000000
 ./userland/c/extra moveread
 mark "$?" "movein"
 
-say "dontunmap"
+say "moveout"
 unload
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-260001000
-./userland/c/extra dontunmap
-mark "$?" "dontunmap"
+load path=extra data=260000000-270001000
+./userland/c/extra moveout
+mark "$?" "moveout"
 
-say "fixeddontunmap"
+say "movespan"
 unload
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-280000000
-./userland/c/extra fixeddontunmap
-mark "$?" "fixeddontunmap"
+load path=extra data=260000000-270001000
+./userland/c/extra movespan
+mark "$?" "movespan"
 
-say "execguard"
+say "mppart"
 unload
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-260001000
-./userland/c/extra execguard
-mark "$?" "execguard"
-
-say "rowrite"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra
-./userland/c/extra rowrite
-mark "$?" "rowrite"
-
-say "vforkwrite"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra
-./userland/c/extra vforkwrite
-mark "$?" "vforkwrite"
-
-say "vforkfork"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-260001000
-./userland/c/extra vforkfork
-mark "$?" "vforkfork"
-
-say "badprot"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra
-./userland/c/extra badprot
-mark "$?" "badprot"
-
-say "partial"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra
-./userland/c/extra partial
-mark "$?" "partial"
-
-say "fixedwx"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-260001000
-./userland/c/extra fixedwx
-mark "$?" "fixedwx"
-
-say "fixedover"
-unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
-load path=extra data=260000000-280000000
-./userland/c/extra fixedover
-mark "$?" "fixedover"
+load path=extra data=260000000-260003000
+./userland/c/extra mppart
+mark "$?" "mppart"
 
 say "rearm"
 unload
@@ -463,9 +409,12 @@ mark "$?" "outside"
 
 say "baddata"
 unload
+# Deliberately NOT load(): this case asserts that insmod REJECTS a bad
+# data= range, so a nonzero exit is the pass condition. load() treats a
+# nonzero exit as fatal and would end the run before the test could judge it.
 sudo insmod ./pagedrop.ko path=extra data=zz
 if [ $? -eq 0 ]; then
-	sudo rmmod pagedrop 2>/dev/null || true
+	unload
 	mark 1 "baddata"
 else
 	mark 0 "baddata"
@@ -532,6 +481,89 @@ load path=upxtest
 sudo /tmp/pb_check 900f1f440000909048b81122334455667788 /tmp/upxtest
 mark "$?" "upx"
 
+say "badprot"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra
+./userland/c/extra badprot
+mark "$?" "badprot"
+say "execguard"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260001000
+./userland/c/extra execguard
+mark "$?" "execguard"
+say "fixeddontunmap"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-280000000
+./userland/c/extra fixeddontunmap
+mark "$?" "fixeddontunmap"
+say "fixedover"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-280000000
+./userland/c/extra fixedover
+mark "$?" "fixedover"
+say "fixedwx"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260001000
+./userland/c/extra fixedwx
+mark "$?" "fixedwx"
+say "partial"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra
+./userland/c/extra partial
+mark "$?" "partial"
+unload
+say "pinmove"
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace /tmp/pbpin.fifo
+mkfifo /tmp/pbpin.fifo
+load path=extra data=260000000-280000000
+./userland/c/extra pinmove > /tmp/pbpin.fifo &
+pinpid=$!
+exec 3< /tmp/pbpin.fifo
+ready=
+ref=
+read -r -t 5 -u 3 ready
+# The release is asynchronous. Poll for a second with builtins only, while
+# extra is still alive and nothing exits, so only the move can release it.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	read -r ref < /sys/module/pagedrop/refcnt
+	[ "$ref" = 0 ] && break
+	read -r -t 0.1 -u 3 _ || true
+done
+echo "pinmove: extra said '$ready', refcnt $ref"
+if [ "$ready" = moved ] && [ "$ref" = 0 ]; then
+	mark 0 "pinmove"
+else
+	mark 1 "pinmove"
+fi
+kill "$pinpid" 2>/dev/null
+wait "$pinpid" 2>/dev/null
+exec 3<&-
+rm -f /tmp/pbpin.fifo
+say "regs"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+load path=extra
+./userland/c/extra regs
+mark "$?" "regs"
+say "vforkfork"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260001000
+./userland/c/extra vforkfork
+mark "$?" "vforkfork"
+say "vforkwrite"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra
+./userland/c/extra vforkwrite
+mark "$?" "vforkwrite"
+
 oops=$(sudo dmesg | grep -E 'Oops|BUG:' | tail -3 || true)
 if [ -n "$oops" ]; then
 	echo "$oops"
@@ -539,7 +571,7 @@ if [ -n "$oops" ]; then
 else
 	mark 0 "no oops"
 fi
-( unload ) || mark 1 "rmmod"
+sudo rmmod pagedrop || mark 1 "rmmod"
 if [ "$fail" -eq 0 ]; then
 	echo "ALL PASS"
 else
