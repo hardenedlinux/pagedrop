@@ -105,6 +105,14 @@ static DEFINE_MUTEX(marea_lock);
  * before any mm lock and before marea_lock, never under them. Fault paths
  * do not take it: they run with no mm lock held, and only restore pages
  * their records already allow.
+ *
+ * That order rests on one assumption: no caller of vm_mmap_pgoff holds an
+ * mm lock. fh_vm_mmap_pgoff takes this lock, and pb_try_arm, under it,
+ * reaches mmap_write_lock through mprotect. vm_mmap_pgoff takes
+ * mmap_write_lock itself, so no in-tree caller can hold it. A run with
+ * CONFIG_PROVE_LOCKING, on 5.10 arm64 and 7.0 x86, records
+ * pb_vm_lock -> mmap_lock and no edge from an mm lock into this lock or
+ * marea_lock.
  */
 static DEFINE_MUTEX(pb_vm_lock);
 static unsigned long epoch_counter;
