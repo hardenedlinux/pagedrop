@@ -396,6 +396,38 @@ static bool pb_parent_tracked(void)
 	return tgid > 0 && pb_tgid_has(tgid);
 }
 
+/*
+ * The tgid whose records stand in for current's while current does not own
+ * its own: the nearest listed ancestor that does. One level is not enough.
+ * The parent can itself still be waiting for its copy, as a vfork child is
+ * for its whole life, and then it holds no records at all. A child forked
+ * there would copy nothing, be marked as owning, and lose the records for
+ * good. The walk follows real_parent while the ancestors are listed, and
+ * stops at the first one that owns. 0 if there is none.
+ */
+static pid_t pb_records_tgid(void)
+{
+	struct task_struct *task;
+	pid_t tgid = 0;
+	int depth;
+
+	rcu_read_lock();
+	task = rcu_dereference(current->real_parent);
+	for (depth = 0; task && depth < 64; depth++) {
+		pid_t cand = task->tgid;
+
+		if (cand <= 0 || !pb_tgid_has(cand))
+			break;
+		if (pb_tgid_own(cand)) {
+			tgid = cand;
+			break;
+		}
+		task = rcu_dereference(task->real_parent);
+	}
+	rcu_read_unlock();
+	return tgid;
+}
+
 static bool pb_is_target(void)
 {
 	pid_t tgid;
@@ -612,7 +644,7 @@ static bool pb_take_page(unsigned long addr, unsigned long *page_addr, unsigned 
 	struct marea *page;
 	bool found = false;
 	bool use_parent = !pb_tgid_own(current->tgid);
-	pid_t parent = pb_parent_tgid();
+	pid_t parent = use_parent ? pb_records_tgid() : 0;
 
 	mutex_lock(&marea_lock);
 	page = search_page(current->tgid, addr);
@@ -2002,16 +2034,21 @@ static bool pb_ip_tracked_for(pid_t tgid, unsigned long ip, unsigned long *epoch
 }
 
 /*
- * The parent's records stand in for a fork child's only until the parent
- * has copied them, see pb_handle_data. Read own first, for the same reason.
+ * The nearest owning ancestor's records stand in for a fork child's only
+ * until the parent has copied them, see pb_handle_data and pb_records_tgid.
+ * Read own first, for the same reason.
  */
 static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
 {
 	bool use_parent = !pb_tgid_own(current->tgid);
+	pid_t parent;
 
 	if (pb_ip_tracked_for(current->tgid, ip, epoch))
 		return true;
-	return use_parent && pb_ip_tracked_for(pb_parent_tgid(), ip, epoch);
+	if (!use_parent)
+		return false;
+	parent = pb_records_tgid();
+	return parent > 0 && pb_ip_tracked_for(parent, ip, epoch);
 }
 
 static bool pb_armed_prot_for(pid_t tgid, unsigned long page, unsigned long *prot_out)
@@ -2105,7 +2142,7 @@ static int pb_handle_data(unsigned long address)
 	 * it says so.
 	 */
 	armed = pb_armed_prot_for(tgid, page, &restore);
-	parent = pb_parent_tgid();
+	parent = use_parent ? pb_records_tgid() : 0;
 	if (!armed && use_parent && parent > 0 && parent != tgid)
 		armed = pb_armed_prot_for(parent, page, &restore);
 	if (!armed || !restore) {
@@ -2361,7 +2398,8 @@ static long pb_do_exec(bool matched, long (*real)(struct pt_regs *), struct pt_r
 	 * After vfork, and posix_spawn, the parent only runs once the child
 	 * has exec'd, so it is always the second case.
 	 *
-	 * In that case do the parent's copy here, in the same hold. The exec
+	 * In that case do the parent's copy here, in the same hold, from the
+	 * nearest ancestor that owns its records (pb_records_tgid). The exec
 	 * can still fail and leave the old image running, and that image
 	 * needs the records it inherited. The parent is still alive at this
 	 * point: it has not finished pb_note_child, so it has not returned
@@ -2373,7 +2411,7 @@ static long pb_do_exec(bool matched, long (*real)(struct pt_regs *), struct pt_r
 	 * pb_is_target has not listed it yet.
 	 */
 	if (matched || tracked || pb_parent_tracked()) {
-		parent = pb_parent_tgid();
+		parent = pb_records_tgid();
 		mutex_lock(&marea_lock);
 		if (!pb_tgid_own(tgid) && parent > 0 && parent != tgid &&
 		    pb_tgid_has(parent)) {
@@ -2509,8 +2547,20 @@ static void pb_note_child(long child, unsigned long flags, bool has_flags)
 	 * reused.
 	 */
 	if (pb_group_alive(task)) {
+		pid_t from = current->tgid;
+
+		/*
+		 * A parent still waiting for its own copy holds no records,
+		 * so copy from the ancestor that it is waiting on.
+		 */
+		if (!pb_tgid_own(from)) {
+			pid_t up = pb_records_tgid();
+
+			if (up > 0)
+				from = up;
+		}
 		pb_tgid_add(tgid, false);
-		pb_copy_tracking(current->tgid, tgid);
+		pb_copy_tracking(from, tgid);
 		if (!pb_group_alive(task))
 			pb_drop_child(tgid);
 	}

@@ -393,6 +393,13 @@ load path=extra
 ./userland/c/extra vforkwrite
 mark "$?" "vforkwrite"
 
+say "vforkfork"
+unload
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+load path=extra data=260000000-260001000
+./userland/c/extra vforkfork
+mark "$?" "vforkfork"
+
 say "badprot"
 unload
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace

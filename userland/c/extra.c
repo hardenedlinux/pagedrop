@@ -1814,6 +1814,70 @@ static int do_rowrite(void)
  * must not get a SIGSEGV. vfork shares the memory, so the parent sees the
  * store.
  */
+/*
+ * Run with data=260000000-260001000. A vfork child stays in its copy window
+ * for its whole life: the parent runs pb_note_child only once the child has
+ * exited. A child forked inside that window must get the records of the
+ * nearest ancestor that owns them, here the vfork parent, not the empty set
+ * of its own parent. The grandchild reads the armed page, and without those
+ * records the read is a real SIGSEGV.
+ */
+static int do_vforkfork(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pid_t pid;
+	int st;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("vforkfork mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("vforkfork rx");
+		return 1;
+	}
+	pid = vfork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		long c;
+		int cst;
+
+		/*
+		 * Any hooked call lists this child, as a child of a tracked
+		 * process that does not own its records yet. munmap of an
+		 * unmapped range changes nothing in the shared mm.
+		 */
+		munmap((void *)0x2b0000000UL, PAGE);
+		c = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+		if (c == 0)
+			_exit(*(volatile unsigned char *)data == 'B' ? 0 : 2);
+		if (c < 0)
+			_exit(3);
+		if (waitpid(c, &cst, 0) < 0)
+			_exit(4);
+		if (WIFSIGNALED(cst))
+			_exit(100 + WTERMSIG(cst));
+		_exit(WIFEXITED(cst) ? WEXITSTATUS(cst) : 5);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		if (WIFEXITED(st) && WEXITSTATUS(st) > 100)
+			fprintf(stderr, "vforkfork: grandchild killed by signal %d\n",
+				WEXITSTATUS(st) - 100);
+		else
+			fprintf(stderr, "vforkfork: status %#x\n", st);
+		return 1;
+	}
+	printf("vforkfork ok\n");
+	return 0;
+}
+
 static int do_vforkwrite(void)
 {
 	unsigned char *p;
@@ -2189,6 +2253,8 @@ int main(int argc, char **argv)
 		return do_disarm();
 	if (!strcmp(argv[1], "vforkwrite"))
 		return do_vforkwrite();
+	if (!strcmp(argv[1], "vforkfork"))
+		return do_vforkfork();
 	if (!strcmp(argv[1], "fixedover"))
 		return do_fixedover();
 	if (!strcmp(argv[1], "partial"))
@@ -2219,6 +2285,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|fixedwx|badprot|partial|fixedover|commname|dontunmap|fixeddontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|regs|fail|read|forkread|forkrace|pin|pinmove|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|rowrite|vforkwrite|vforkfork|fixedwx|badprot|partial|fixedover|commname|dontunmap|fixeddontunmap|execguard|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }

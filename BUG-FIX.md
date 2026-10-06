@@ -409,6 +409,14 @@ The tests now avoid the exit that hid this. `extra pin` prints `armed` once the 
 
 The run scripts also stopped trusting `rmmod` and `insmod`. Each test used `sudo rmmod pagedrop 2>/dev/null || true` and an unchecked `insmod`. A pinned module made `rmmod` fail, `insmod` then failed with `EEXIST`, and the test ran on the previous module with the previous `path=` and `data=`. `unload` now retries `rmmod` for 10 seconds, `load` checks `insmod`, and the suite stops if either one fails.
 
+## A child forked inside its parent's copy window lost the records for good
+
+The fork bookkeeping fell back one level only. While a child does not own its records yet, its faults use its parent's. `pb_note_child` copied from the forking process, though, even when that process was itself still waiting for its own copy, and then marked the new child as owning. Any hooked call lists such a parent with `own == false`. A vfork child stays in that state for its whole life, because the vfork parent runs `pb_note_child` only after it exits. A grandchild forked there got an empty copy and `own == true`, and had no fallback left. Before `own` existed the loss lasted only for the window. With `own` it was permanent.
+
+Found by the maintainer's review of PR #1. `extra vforkfork`, with `data=260000000-260001000`, arms a page, vforks, and from the vfork child makes a hooked call and forks again. The grandchild reads the armed page. With the module unloaded it passes. With the module loaded and before the fix, the grandchild was killed by `SIGSEGV` on arm64 and x86.
+
+Fix: `pb_records_tgid` walks `real_parent` while the ancestors are listed and returns the nearest one that owns its records. `pb_note_child` copies from it when the forking process does not own its own. The fault fallbacks in `pb_take_page`, `pb_ip_tracked` and `pb_handle_data`, and the copy that `pb_do_exec` makes before an exec, use it in place of the immediate parent. `extra vforkfork` passes on both arches.
+
 ## Loaded-module runs
 
 arm64 has now been run with the module loaded: Orange Pi 3B (RK3566), Ubuntu 22.04, kernel 5.10.160-rockchip-rk356x rebuilt with `CONFIG_KPROBES=y`, UPX 5.0.2. `tools/arm64/run_tests.sh` passed all 60 checks, `badprot`, `partial`, `fixedover`, `pin` and `pinmove` included, with no oops or warning in `dmesg`. x86 has been run too: Ubuntu 26.04.1, kernel 7.0.0-38-generic, ftrace, gcc 15.2.0, UPX 4.2.4, bare metal. `tools/x86/run_tests.sh` passed all 58 checks, with no oops or warning in `dmesg`.
