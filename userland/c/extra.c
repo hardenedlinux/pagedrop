@@ -30,6 +30,15 @@
 
 #define READ_DATA 0x260000000UL
 #define READ_CODE 0x261000000UL
+/*
+ * How many index rows the second phase may add. Measured as a delta, not an
+ * absolute: a plain run of this case already writes about 450 rows for the
+ * process's own executable pages (libc, ld, the binary), so an absolute bound
+ * has to be set above the baseline and stops being a check. An earlier attempt
+ * keyed the re-arm on the global epoch counter and produced 177,256 read rows
+ * in one dumprace run; this bound is what would have caught it.
+ */
+#define EPOCHREAD_MAX_ROWS 16
 #define MOVED_ADDR 0x270000000UL
 /*
  * Destinations for our own move cases. These must not collide with an
@@ -372,6 +381,41 @@ static int trace_has(unsigned long va)
 	return found;
 }
 
+static int trace_count(unsigned long va)
+{
+	FILE *f;
+	char line[128];
+	int n = 0;
+
+	f = fopen("/tmp/pagedrop.trace", "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		unsigned long ip, data, epoch;
+
+		if (sscanf(line, "%lx %lx %lu", &ip, &data, &epoch) != 3)
+			continue;
+		if (data == va)
+			n++;
+	}
+	fclose(f);
+	return n;
+}
+
+static int index_rows(void)
+{
+	FILE *f = fopen("/tmp/pagedrop.index", "r");
+	char line[256];
+	int n = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f))
+		n++;
+	fclose(f);
+	return n;
+}
+
 static int do_read(void)
 {
 	unsigned char *data;
@@ -447,6 +491,95 @@ static int do_read(void)
 		return 1;
 	}
 	printf("read ok\n");
+	return 0;
+}
+
+/*
+ * One data page read through two handler versions must be traced twice.
+ *
+ * A read fault restores the page and keeps its record, so the page never
+ * faults again and the address would be observed once for the life of the
+ * process. Re-mprotect the handler page so its epoch advances, read the same
+ * data address again, and the second read must be traced at the new epoch.
+ *
+ * The row ceiling is load-bearing and is the reason this case can be trusted.
+ * An earlier attempt keyed the re-arm on the global epoch counter, which
+ * advances on every dump of any page, so each re-arm bought another fault and
+ * another dump: one dumprace run produced 177,256 read rows. Asserting the
+ * trace count alone would not have caught that, because the first two lines
+ * still appear in the right order. Bound the total work instead.
+ */
+static int do_epochread(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	int first, second, rows_before, rows_after;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("epochread mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+#if defined(__aarch64__)
+	{
+		uint32_t *w = (uint32_t *)code;
+
+		w[0] = 0xd2800001;
+		w[1] = 0xf2ac0001;
+		w[2] = 0xf2c00041;
+		w[3] = 0xf9400020;
+		w[4] = 0xd65f03c0;
+	}
+#else
+	{
+		unsigned char stub[] = {
+			0x48, 0xb8, 0x00, 0x00, 0x00, 0x60, 0x02, 0x00, 0x00, 0x00,
+			0x48, 0x8b, 0x00,
+			0xc3
+		};
+		memcpy(code, stub, sizeof(stub));
+	}
+#endif
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("epochread rx");
+		return 1;
+	}
+	arm_fault();
+	if (!call_ok(code)) {
+		fprintf(stderr, "epochread: first load fault not swallowed\n");
+		return 1;
+	}
+	first = trace_count(READ_DATA);
+	rows_before = index_rows();
+	if (first != 1) {
+		fprintf(stderr, "epochread: first read traced %d times, want 1\n",
+			first);
+		return 1;
+	}
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("epochread re-rx");
+		return 1;
+	}
+	if (!call_ok(code)) {
+		fprintf(stderr, "epochread: second load fault not swallowed\n");
+		return 1;
+	}
+	second = trace_count(READ_DATA);
+	if (second != 2) {
+		fprintf(stderr, "epochread: after a new handler epoch traced %d "
+			"times, want 2\n", second);
+		return 1;
+	}
+	rows_after = index_rows();
+	if (rows_after - rows_before > EPOCHREAD_MAX_ROWS) {
+		fprintf(stderr, "epochread: the second handler version added %d "
+			"index rows, want at most %d; the re-arm is feeding "
+			"itself\n", rows_after - rows_before, EPOCHREAD_MAX_ROWS);
+		return 1;
+	}
+	printf("epochread ok\n");
 	return 0;
 }
 
@@ -2181,6 +2314,120 @@ static int do_rowrite(void)
 	return 0;
 }
 
+/*
+ * A data fault the module cannot attribute, on a page whose VMA forbids the
+ * access. Unloaded that is a SIGSEGV, every time; the case exists to pin that
+ * the loaded run delivers it too, and never livelocks. The stack depth is
+ * varied per iteration because the decision on that path reads two locals that
+ * pb_take_page leaves untouched when it finds no record, so one fixed depth
+ * would measure one value of that leftover.
+ */
+static unsigned long fs_sink;
+
+static void fs_sink_to(unsigned int depth)
+{
+	volatile unsigned long v = fs_sink;
+
+	if (depth)
+		fs_sink_to(depth - 1);
+	else
+		fs_sink = v;
+}
+
+static int fs_store(unsigned char *p, unsigned int depth)
+{
+	fs_sink_to(depth);
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) != 0)
+		return 1;
+	*(volatile unsigned char *)p = 1;
+	return 0;
+}
+
+static void fs_show(const char *what, unsigned long addr)
+{
+	char line[512], path[64];
+	unsigned long lo, hi;
+	FILE *f;
+
+	printf("%s at %lx: ", what, addr);
+	snprintf(path, sizeof(path), "/proc/%d/maps", getpid());
+	f = fopen(path, "r");
+	if (!f) {
+		printf("maps unavailable\n");
+		return;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && addr >= lo && addr < hi) {
+			fputs(line, stdout);
+			fclose(f);
+			return;
+		}
+	}
+	printf("not mapped\n");
+	fclose(f);
+}
+
+static int fs_leg(const char *what, unsigned char *p, int prot, int n)
+{
+	int i, faulted_ok = 0, missed = -1;
+
+	if (prot >= 0 && mprotect(p, PAGE, prot) != 0) {
+		perror("faultstore mprotect");
+		return 1;
+	}
+	fs_show(what, (unsigned long)p);
+	for (i = 0; i < n; i++) {
+		if (fs_store(p, (unsigned int)(i & 7)))
+			faulted_ok++;
+		else {
+			missed = i;
+			break;
+		}
+	}
+	if (missed >= 0)
+		fprintf(stderr, "faultstore: %s store %d did not fault\n", what, missed);
+	printf("%s: %d/%d stores delivered a signal\n", what, faulted_ok, n);
+	return missed >= 0 ? 1 : 0;
+}
+
+static int do_faultstore(void)
+{
+	unsigned char *ro, *none, *gone;
+	int rc = 0;
+
+	if (!map_fixed(READ_DATA, PROT_READ | PROT_WRITE)) {
+		perror("faultstore data mmap");
+		return 1;
+	}
+	ro = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	none = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	gone = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ro == MAP_FAILED || none == MAP_FAILED || gone == MAP_FAILED) {
+		perror("faultstore mmap");
+		return 1;
+	}
+	*(volatile unsigned char *)READ_DATA = 1;
+	arm_fault();
+	if (fs_leg("ro-page", ro, PROT_READ, 200))
+		rc = 1;
+	if (fs_leg("none-page", none, PROT_NONE, 200))
+		rc = 1;
+	if (munmap(gone, PAGE) != 0) {
+		perror("faultstore munmap");
+		return 1;
+	}
+	if (fs_leg("unmapped", gone, -1, 200))
+		rc = 1;
+	if (fs_leg("data-range", (unsigned char *)READ_DATA, PROT_READ, 200))
+		rc = 1;
+	alarm(0);
+	if (rc)
+		return 1;
+	printf("faultstore ok\n");
+	return 0;
+}
+
 static int do_commname(void)
 {
 	unsigned char *p;
@@ -2756,6 +3003,8 @@ int main(int argc, char **argv)
 		return do_flip();
 	if (!strcmp(argv[1], "fail"))
 		return do_fail();
+	if (!strcmp(argv[1], "epochread"))
+		return do_epochread();
 	if (!strcmp(argv[1], "read"))
 		return do_read();
 	if (!strcmp(argv[1], "armexec"))
@@ -2814,6 +3063,8 @@ int main(int argc, char **argv)
 		return do_noneexec();
 	if (!strcmp(argv[1], "rowrite"))
 		return do_rowrite();
+	if (!strcmp(argv[1], "faultstore"))
+		return do_faultstore();
 	if (!strcmp(argv[1], "commname"))
 		return do_commname();
 	if (!strcmp(argv[1], "dontunmap"))
@@ -2852,6 +3103,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|fail|read|armexec|forkread|forkrace|pin|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|moveout|movespan|mppart|rearm|fixed|pair|vfork|outside|wrarm|noneexec|rowrite commname dontunmap disarm|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|fail|read|armexec|forkread|forkrace|pin|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|moveout|movespan|mppart|rearm|fixed|pair|vfork|outside|wrarm|noneexec|rowrite|faultstore commname dontunmap disarm|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }

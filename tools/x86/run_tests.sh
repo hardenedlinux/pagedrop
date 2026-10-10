@@ -24,6 +24,15 @@ mark() {
 # This is the false pass AGENTS.md warns about: rmmod was allowed to fail and
 # insmod's EEXIST was ignored, so a case could print PASS while measuring the
 # module that was already loaded.
+# Remove dump files and the index and trace, bounded so a large dump count
+# cannot overflow the argument list. A glob here dies with "Argument list too
+# long" and the cleanup then silently stops, so every later case measures the
+# previous run's dumps instead of its own.
+clean_dumps() {
+	sudo find /tmp -maxdepth 1 -name '[0-9a-f]*_[0-9]*' -type f -delete 2>/dev/null
+	sudo rm -f /tmp/pagedrop.index /tmp/pagedrop.trace "$@"
+}
+
 unload() {
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
 		grep -q '^pagedrop ' /proc/modules || return 0
@@ -58,7 +67,7 @@ python3 tools/test_pb_rank.py
 mark $? pb_rank
 
 say "hooks"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=simple
 hooks=$(sudo dmesg | grep 'pagedrop: hooked' | tail -13)
 	echo "$hooks"
@@ -72,7 +81,7 @@ done
 mark "$missing" "hooks"
 
 say "simple"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 text=$(python3 - << 'PY'
 import struct
 data=open("userland/c/simple","rb").read()
@@ -94,7 +103,7 @@ mark "$?" "simple"
 
 say "sigsegv"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=sigsegv
 sudo /tmp/pb_check 31c048bbd19d9691d08c97ff ./userland/c/sigsegv.out
 mark "$?" "sigsegv live"
@@ -109,31 +118,31 @@ mark "$?" "sigsegv file"
 
 say "capture"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=capture
 ./userland/c/capture
 mark "$?" "capture"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 sudo /tmp/pb_addr ./userland/c/capture
 mark "$?" "capture mremap"
 
 say "epoch"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=extra
 ./userland/c/extra epoch
 mark "$?" "epoch"
 
 say "exact"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=extr exact=1
 ./userland/c/extra epoch
 if [ $? -eq 0 ]; then
 	mark 1 "exact"
 else
 	unload
-	sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+	clean_dumps
 	load path=extra exact=1
 	./userland/c/extra epoch
 	mark $? "exact"
@@ -141,21 +150,33 @@ fi
 
 say "flip"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=extra
 ./userland/c/extra flip
 mark "$?" "flip"
 
 say "rowrite"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra
 ./userland/c/extra rowrite
 mark "$?" "rowrite"
 
+say "faultstore"
+unload
+clean_dumps
+load path=extra data=260000000-260001000
+./userland/c/extra faultstore
+mark "$?" "faultstore"
+unload
+clean_dumps
+load path=extra
+./userland/c/extra faultstore
+mark "$?" "faultstore no-data"
+
 say "commname"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra
 ./userland/c/extra commname
 mark "$?" "commname"
@@ -176,14 +197,21 @@ mark "$?" "index commname"
 
 say "dontunmap"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra dontunmap
 mark "$?" "dontunmap"
 
+say "epochread"
+unload
+clean_dumps
+load path=extra data=260000000-260001000
+./userland/c/extra epochread
+mark "$?" "epochread"
+
 say "read"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra read
 mark "$?" "read"
@@ -202,77 +230,77 @@ mark "$?" "index read"
 
 say "armexec"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260002000
 ./userland/c/extra armexec
 mark "$?" "armexec"
 
 say "forkread"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra forkread
 mark "$?" "forkread"
 
 say "forkrace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra forkrace
 mark "$?" "forkrace"
 
 say "dumprace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra dumprace
 mark "$?" "dumprace"
 
 say "armrace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra armrace
 mark "$?" "armrace"
 
 say "mremaprace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260010000
 ./userland/c/extra mremaprace
 mark "$?" "mremaprace"
 
 say "datarace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra datarace
 mark "$?" "datarace"
 
 say "munmaprace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra munmaprace
 mark "$?" "munmaprace"
 
 say "clonevm"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra clonevm
 mark "$?" "clonevm"
 
 say "maymove"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260010000
 ./userland/c/extra maymove
 mark "$?" "maymove"
 
 say "execrace"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 cp -f userland/c/extra /tmp/stalehelper
 load path=extra data=260000000-260001000
 ./userland/c/extra execrace
@@ -284,7 +312,7 @@ fi
 
 say "rankload"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=capture
 ./userland/c/capture
 capture_rc=$?
@@ -296,7 +324,7 @@ mark "$capture_rc" "rankload capture"
 
 say "pin"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra pin &
 pinpid=$!
@@ -317,7 +345,7 @@ done
 
 say "pinoff"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra read
 mark $? "pinoff read"
@@ -333,63 +361,63 @@ mark "$pinoff" "pinoff rmmod"
 
 say "roarm"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra roarm
 mark "$?" "roarm"
 
 say "moveread"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra moveread
 mark "$?" "moveread"
 
 say "movein"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-280000000
 ./userland/c/extra moveread
 mark "$?" "movein"
 
 say "moveout"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-270001000
 ./userland/c/extra moveout
 mark "$?" "moveout"
 
 say "movespan"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-270001000
 ./userland/c/extra movespan
 mark "$?" "movespan"
 
 say "mppart"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260003000
 ./userland/c/extra mppart
 mark "$?" "mppart"
 
 say "rearm"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra rearm
 mark "$?" "rearm"
 
 say "fixed"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra fixed
 mark "$?" "fixed"
 
 say "pair"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=extra
 ./userland/c/extra pair
 mark "$?" "pair"
@@ -422,28 +450,28 @@ fi
 
 say "wrarm"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra wrarm
 mark "$?" "wrarm"
 
 say "noneexec"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra noneexec
 mark "$?" "noneexec"
 
 say "disarm"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra disarm
 mark "$?" "disarm"
 
 say "stale"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 cp -f userland/c/extra /tmp/stalehelper
 load path=extra
 timeout 3 ./userland/c/extra stale
@@ -455,7 +483,7 @@ fi
 
 say "execfail"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 cp -f userland/c/extra /tmp/exectest
 load path=exectest
 /tmp/exectest fail
@@ -463,19 +491,19 @@ mark "$?" "execfail"
 
 say "execve"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 mkdir -p /tmp/pbmatch
 cp -f userland/c/extra /tmp/pbmatch/notme
 load path=pbmatch
 ./userland/c/extra execve
 mark "$?" "execve"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 ./userland/c/extra execveat
 mark "$?" "execveat"
 
 say "upx"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=upxtest
 /tmp/upxtest
 sudo /tmp/pb_check 900f1f440000909048b81122334455667788 /tmp/upxtest
@@ -483,43 +511,43 @@ mark "$?" "upx"
 
 say "badprot"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra
 ./userland/c/extra badprot
 mark "$?" "badprot"
 say "execguard"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra execguard
 mark "$?" "execguard"
 say "fixeddontunmap"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-280000000
 ./userland/c/extra fixeddontunmap
 mark "$?" "fixeddontunmap"
 say "fixedover"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-280000000
 ./userland/c/extra fixedover
 mark "$?" "fixedover"
 say "fixedwx"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra fixedwx
 mark "$?" "fixedwx"
 say "partial"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra
 ./userland/c/extra partial
 mark "$?" "partial"
 unload
 say "pinmove"
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace /tmp/pbpin.fifo
+clean_dumps /tmp/pbpin.fifo
 mkfifo /tmp/pbpin.fifo
 load path=extra data=260000000-280000000
 ./userland/c/extra pinmove > /tmp/pbpin.fifo &
@@ -547,19 +575,19 @@ exec 3<&-
 rm -f /tmp/pbpin.fifo
 say "regs"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+clean_dumps
 load path=extra
 ./userland/c/extra regs
 mark "$?" "regs"
 say "vforkfork"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra data=260000000-260001000
 ./userland/c/extra vforkfork
 mark "$?" "vforkfork"
 say "vforkwrite"
 unload
-sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+clean_dumps
 load path=extra
 ./userland/c/extra vforkwrite
 mark "$?" "vforkwrite"

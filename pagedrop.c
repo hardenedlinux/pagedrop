@@ -123,6 +123,14 @@ struct marea {
 	unsigned long prot;
 	pid_t tgid;
 	unsigned long epoch;
+	/*
+	 * The handler page whose execution consumed this address, for a
+	 * data_seen row. Keyed on the page, not on the global epoch counter:
+	 * the counter advances on every dump anywhere, so a row keyed on it is
+	 * re-armed by unrelated pages, and one read turns into a fault and a
+	 * dump per tracked page in the process.
+	 */
+	unsigned long handler;
 	bool restored;
 };
 
@@ -201,6 +209,8 @@ static void pb_pin_recheck(struct work_struct *work)
 
 
 static bool pb_name_matches(const char *name);
+static void pb_rearm_stale(pid_t tgid, unsigned long handler,
+			    unsigned long epoch);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 #define pb_access_ok(addr, size) access_ok(VERIFY_READ, (addr), (size))
@@ -534,6 +544,7 @@ static struct marea *new_marea(pid_t tgid, unsigned long addr, unsigned long pro
 	new_m->prot = prot;
 	new_m->tgid = tgid;
 	new_m->epoch = 0;
+	new_m->handler = 0;
 	new_m->restored = false;
 	INIT_LIST_HEAD(&new_m->list);
 	return new_m;
@@ -741,6 +752,8 @@ static int dump_to_file(unsigned long user_addr, size_t size, const char *why,
 	if (written < 0 || (size_t)written != size)
 		return written < 0 ? written : -EIO;
 	pb_note_epoch(tgid, user_addr, ep);
+	if (search_page(tgid, user_addr) && strcmp(why, "read"))
+		pb_rearm_stale(tgid, user_addr, ep);
 	snprintf(line, sizeof(line), "%d %s %lx %lu %s\n", tgid,
 		 pb_index_comm(current->comm), user_addr, ep, why);
 	pb_log_line("/tmp/pagedrop.index", line);
@@ -1115,6 +1128,58 @@ static void pb_armed_rearm(pid_t tgid, unsigned long addr, unsigned long len)
 		mutex_unlock(&marea_lock);
 		pb_seen_forget(tgid, page);
 	}
+}
+
+/*
+ * Re-arm the data pages this tgid traced through one handler page, when that
+ * handler page is dumped again.
+ *
+ * A read fault restores the page and leaves its record in place, so the page
+ * stays readable and no later read faults: without this, a data address is
+ * observed once for the life of the process rather than once per handler
+ * version. A dump of a tracked handler page is the only place the module learns
+ * that page has a new version.
+ *
+ * The match is on the handler page, deliberately. Keying on the epoch counter
+ * instead re-arms on every dump of any page, because the counter advances for
+ * all of them: measured, one dumprace run then produced 177,256 read dumps,
+ * since each re-arm bought another fault and another dump. Keyed on the page,
+ * a handler version re-arms exactly the addresses that version consumed.
+ *
+ * Rows are dropped under the lock and the pages re-armed with it released,
+ * because pb_armed_rearm calls pb_mprotect and marea_lock is never held across
+ * one.
+ */
+static void pb_rearm_stale(pid_t tgid, unsigned long handler, unsigned long epoch)
+{
+	struct marea *seen, *tmp;
+	unsigned long *pages = NULL;
+	int want = 0, have = 0, i;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(seen, &data_seen, list)
+		if (seen->tgid == tgid && seen->handler == handler &&
+		    seen->epoch < epoch)
+			want++;
+	if (want) {
+		pages = kzalloc((size_t)want * sizeof(*pages), GFP_KERNEL);
+		if (pages) {
+			list_for_each_entry_safe(seen, tmp, &data_seen, list) {
+				if (seen->tgid != tgid ||
+				    seen->handler != handler ||
+				    seen->epoch >= epoch)
+					continue;
+				pages[have++] = seen->addr;
+				list_del(&seen->list);
+				kfree(seen);
+			}
+		}
+	}
+	mutex_unlock(&marea_lock);
+
+	for (i = 0; i < have; i++)
+		pb_armed_rearm(tgid, pages[i], PAGE_SIZE);
+	kvfree(pages);
 }
 
 static void pb_drop_tgid_list(struct list_head *head, pid_t tgid)
@@ -1918,7 +1983,8 @@ static void pb_armed_run(pid_t tgid, unsigned long page, unsigned long prot,
 	mutex_unlock(&marea_lock);
 }
 
-static bool pb_data_claim(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+static bool pb_data_claim(pid_t tgid, unsigned long page, unsigned long handler,
+			  unsigned long handler_epoch)
 {
 	struct marea *seen;
 
@@ -1932,6 +1998,7 @@ static bool pb_data_claim(pid_t tgid, unsigned long page, unsigned long handler_
 	}
 	seen = new_marea(tgid, page, 0);
 	if (seen) {
+		seen->handler = handler;
 		seen->epoch = handler_epoch;
 		list_add(&seen->list, &data_seen);
 	}
@@ -2043,7 +2110,7 @@ static int pb_handle_data(unsigned long address)
 	}
 	pb_pin_update_locked();
 	mutex_unlock(&marea_lock);
-	if (tracked && pb_data_claim(tgid, page, handler_epoch)) {
+	if (tracked && pb_data_claim(tgid, page, ip & PAGE_MASK, handler_epoch)) {
 		if (dump_to_file(page, PAGE_SIZE, "read", NULL) == 0)
 			pb_trace_line(ip, page, handler_epoch);
 		else
@@ -2091,8 +2158,25 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	    pb_handle_data(address))
 		return 0;
 
-	if (!pb_take_page(address, &page_addr, &new_prot))
-		return real_force_sig_fault(sig, code, addr);
+	if (!pb_take_page(address, &page_addr, &new_prot)) {
+		/*
+		 * Nothing tracked covers this page, but the access may already be
+		 * legal: a racing thread, or a move of ours that has since finished,
+		 * can have restored or re-established it between the kernel's fault
+		 * and this hook. The kernel had already given up on the page by the
+		 * time it called us, so returning a signal here turns a fault the
+		 * retry would have absorbed into a crash. This is the same
+		 * convergence the data path applies; it was missing here.
+		 *
+		 * Not for an instruction fault. There the VMA's read permission says
+		 * nothing about whether the page is executable, so a fetch the
+		 * kernel refused would be retried for ever: measured, `badprot`
+		 * spun to its 10 second alarm on the first version of this check.
+		 */
+		if (!pb_fault_is_instr() &&
+		    pb_page_satisfies(address & PAGE_MASK, pb_fault_is_write()))
+			return 0;
+	}
 
 	/*
 	 * A tracked page is not always one the module made W+X. Code that was
