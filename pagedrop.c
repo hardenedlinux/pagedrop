@@ -57,6 +57,7 @@
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/task_work.h>
 
 #include <asm/traps.h>
 #if defined(PB_X86_64)
@@ -112,6 +113,8 @@ struct pb_tgid {
 	 * the nearest ancestor that does hold records, not from it.
 	 */
 	bool own;
+	/* How many non-exec snapshots this tgid has queued. Capped. */
+	int snaps;
 };
 
 static LIST_HEAD(tgid_list);
@@ -354,6 +357,7 @@ static bool pb_tgid_add(pid_t tgid, bool own)
 		return false;
 	n->tgid = tgid;
 	n->own = own;
+	n->snaps = 0;
 	INIT_LIST_HEAD(&n->list);
 	spin_lock(&tgid_lock);
 	list_for_each_entry(t, &tgid_list, list) {
@@ -768,6 +772,253 @@ static void dump_pages(unsigned long addr, int n_pages, const char *why)
 
 	for (i = 0; i < n_pages; i++)
 		dump_to_file(addr + (i * PAGE_SIZE), PAGE_SIZE, why, NULL);
+}
+
+/*
+ * One snapshot of the tracked process's other readable mappings.
+ *
+ * Taken when a mapping that is not a library becomes executable. The
+ * packed file's own first mapping can be too early, so a tgid may queue
+ * up to three of these. The callback runs on the way back to user space,
+ * still in the process, not under the mmap lock.
+ *
+ * Stack, heap, vdso, and library files are skipped. A mapping bigger than
+ * 64 pages is skipped. All-zero pages are not written. The index why is
+ * "snap"; that is not a new field.
+ */
+#define PB_SNAP_VMA_MAX		64
+#define PB_SNAP_PAGE_MAX	96
+
+struct pb_snap_tw {
+	struct callback_head cb;
+	pid_t tgid;
+	char comm[TASK_COMM_LEN];
+};
+
+static bool pb_snap_claim(pid_t tgid)
+{
+	struct pb_tgid *t;
+	bool won = false;
+
+	spin_lock(&tgid_lock);
+	list_for_each_entry(t, &tgid_list, list) {
+		if (t->tgid != tgid)
+			continue;
+		if (t->snaps < 3) {
+			t->snaps++;
+			won = true;
+		}
+		break;
+	}
+	spin_unlock(&tgid_lock);
+	return won;
+}
+
+static bool pb_path_is_lib(const char *path)
+{
+	const char *base = strrchr(path, '/');
+
+	base = base ? base + 1 : path;
+	if (!strncmp(base, "libc.so", 7) || !strncmp(base, "libc-", 5))
+		return true;
+	if (!strncmp(base, "ld-linux", 8))
+		return true;
+	if (!strncmp(base, "libstdc++", 9) || !strncmp(base, "libgcc", 6))
+		return true;
+	if (!strncmp(base, "libm.so", 7) || !strncmp(base, "libm-", 5))
+		return true;
+	if (!strncmp(base, "libpthread", 10))
+		return true;
+	if (!strncmp(base, "libdl.so", 8) || !strncmp(base, "libdl-", 6))
+		return true;
+	return false;
+}
+
+static bool pb_file_is_lib(struct file *file)
+{
+	if (!file || !file->f_path.dentry)
+		return true;
+	return pb_path_is_lib(file->f_path.dentry->d_name.name);
+}
+
+static bool pb_skip_vma(struct vm_area_struct *vma, struct mm_struct *mm)
+{
+	unsigned long npages;
+
+	if (!(vma->vm_flags & VM_READ))
+		return true;
+	if (vma->vm_flags & VM_EXEC)
+		return true;
+	if (vma->vm_flags & (VM_IO | VM_PFNMAP))
+		return true;
+#ifdef VM_STACK
+	if (vma->vm_flags & VM_STACK)
+		return true;
+#endif
+	if (vma->vm_flags & VM_GROWSDOWN)
+		return true;
+#ifdef VM_GROWSUP
+	if (vma->vm_flags & VM_GROWSUP)
+		return true;
+#endif
+	if (vma->vm_start == mm->start_brk)
+		return true;
+	if (vma->vm_ops && !vma->vm_file)
+		return true;
+	npages = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
+	if (!npages || npages > PB_SNAP_VMA_MAX)
+		return true;
+	if (vma->vm_file && pb_file_is_lib(vma->vm_file))
+		return true;
+	return false;
+}
+
+static int dump_kpage(pid_t tgid, const char *comm, unsigned long user_addr,
+		      const void *kbuf, const char *why)
+{
+	struct file *dest;
+	char file_path[64];
+	char line[160];
+	loff_t pos = 0;
+	ssize_t written;
+	unsigned long ep;
+
+	mutex_lock(&pb_log_lock);
+	ep = epoch_counter++;
+	mutex_unlock(&pb_log_lock);
+	snprintf(file_path, sizeof(file_path), "/tmp/%lx_%lu", user_addr, ep);
+	dest = filp_open(file_path, O_CREAT | O_WRONLY | O_TRUNC | O_LARGEFILE, 0644);
+	if (IS_ERR(dest))
+		return PTR_ERR(dest);
+	written = kernel_write(dest, kbuf, PAGE_SIZE, &pos);
+	filp_close(dest, NULL);
+	if (written < 0 || (size_t)written != PAGE_SIZE)
+		return written < 0 ? written : -EIO;
+	snprintf(line, sizeof(line), "%d %s %lx %lu %s\n", tgid, comm, user_addr, ep, why);
+	pb_log_line("/tmp/pagedrop.index", line);
+	return 0;
+}
+
+static void pb_snap_cb(struct callback_head *cb)
+{
+	struct pb_snap_tw *tw = container_of(cb, struct pb_snap_tw, cb);
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long *addrs = NULL;
+	void *kbuf = NULL;
+	int n = 0;
+	int i;
+	int wrote = 0;
+	bool locked = false;
+
+	if (!mm)
+		goto out;
+	addrs = kmalloc_array(PB_SNAP_PAGE_MAX, sizeof(*addrs), GFP_KERNEL);
+	kbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!addrs || !kbuf)
+		goto out;
+	if (mmap_read_lock_killable(mm))
+		goto out;
+	locked = true;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	{
+		VMA_ITERATOR(vmi, mm, 0);
+
+		for_each_vma(vmi, vma) {
+			unsigned long addr;
+
+			if (n >= PB_SNAP_PAGE_MAX)
+				break;
+			if (pb_skip_vma(vma, mm))
+				continue;
+			for (addr = vma->vm_start; addr < vma->vm_end && n < PB_SNAP_PAGE_MAX;
+			     addr += PAGE_SIZE)
+				addrs[n++] = addr;
+		}
+	}
+#else
+	for (vma = mm->mmap; vma && n < PB_SNAP_PAGE_MAX; vma = vma->vm_next) {
+		unsigned long addr;
+
+		if (pb_skip_vma(vma, mm))
+			continue;
+		for (addr = vma->vm_start; addr < vma->vm_end && n < PB_SNAP_PAGE_MAX;
+		     addr += PAGE_SIZE)
+			addrs[n++] = addr;
+	}
+#endif
+	mmap_read_unlock(mm);
+	locked = false;
+	for (i = 0; i < n; i++) {
+		if (copy_from_user(kbuf, (void __user *)addrs[i], PAGE_SIZE))
+			continue;
+		if (!memchr_inv(kbuf, 0, PAGE_SIZE))
+			continue;
+		if (!dump_kpage(tw->tgid, tw->comm, addrs[i], kbuf, "snap"))
+			wrote++;
+	}
+	pr_info("snap tgid %d considered %d wrote %d\n", tw->tgid, n, wrote);
+out:
+	if (locked)
+		mmap_read_unlock(mm);
+	kfree(addrs);
+	kfree(kbuf);
+	kfree(tw);
+	module_put(THIS_MODULE);
+}
+
+static void pb_snap_queue(void)
+{
+	struct pb_snap_tw *tw;
+
+	/*
+	 * Deliberately narrower than pb_is_target().
+	 *
+	 * pb_is_target() also accepts a tgid that is already in the list, so a
+	 * stale entry left behind by an exited process makes any later process
+	 * that reuses the number a target. One exec-page dump per mmap is
+	 * bounded. A snapshot copies the whole address space, so that same
+	 * stale entry turned into thousands of dumps of unrelated processes:
+	 * awk, sort, ls, grep, each 60-odd pages. Measured on 6.8.0-106 as
+	 * 16831 files. Only the process the user named may be snapshotted.
+	 */
+	if (!pb_name_matches(current->comm))
+		return;
+	if (!pb_snap_claim(current->tgid))
+		return;
+	if (!try_module_get(THIS_MODULE))
+		return;
+	tw = kmalloc(sizeof(*tw), GFP_ATOMIC);
+	if (!tw) {
+		module_put(THIS_MODULE);
+		return;
+	}
+	tw->tgid = current->tgid;
+	strscpy(tw->comm, current->comm, sizeof(tw->comm));
+	pb_index_comm(tw->comm);
+	init_task_work(&tw->cb, pb_snap_cb);
+	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+		kfree(tw);
+		module_put(THIS_MODULE);
+		pr_info("snap queue failed tgid %d\n", current->tgid);
+		return;
+	}
+	pr_info("snap queued tgid %d\n", tw->tgid);
+}
+
+static bool pb_range_wants_snap(unsigned long addr)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	bool want = false;
+
+	if (!mm || mmap_read_lock_killable(mm))
+		return false;
+	vma = find_vma(mm, addr);
+	if (vma && vma->vm_start <= addr)
+		want = !vma->vm_file || !pb_file_is_lib(vma->vm_file);
+	mmap_read_unlock(mm);
+	return want;
 }
 
 #if defined(PB_HOOK_FTRACE)
@@ -1420,6 +1671,8 @@ static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
 			pb_armed_rearm(current->tgid, addr, len);
 			if (prot_has_x_only(prot) || prot_has_wx(prot))
 				pb_try_arm(addr, end, true);
+			if ((prot & PROT_EXEC) && pb_range_wants_snap(addr))
+				pb_snap_queue();
 		}
 		return ret;
 	}
@@ -1822,6 +2075,8 @@ static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
 			if (dump_to_file(page, PAGE_SIZE, "mmap", NULL) < 0)
 				continue;
 		}
+		if (!file || !pb_file_is_lib(file))
+			pb_snap_queue();
 	} else {
 		untrack_pages(ret, n_pages);
 	}

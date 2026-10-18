@@ -14,6 +14,19 @@ mark() {
 	fi
 }
 
+# A failed rebuild must not fall through. There is no set -e, and a root-owned
+# file in /tmp makes gcc, rm, upx and cp fail while the rest of the suite runs
+# whatever binary was already there and can still print PASS. Measured on the
+# 20261017T042442Z x86 cycle: Packed 0 files, then upx-ok 1 and ALL PASS.
+prep() {
+	"$@"
+	local rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "prep failed ($rc): $*"
+		exit 1
+	fi
+}
+
 # Unload, and insist it worked.
 #
 # A pinned module refuses rmmod for a moment after the last armed page is
@@ -52,17 +65,27 @@ load() {
 }
 
 unload
+# A previous root run can leave a directory the user cannot write. mkdir -p
+# does not replace it, and cp then fails with EACCES. sudo can remove it.
+# The suite already uses sudo for insmod and dump cleanup.
+sudo rm -rf /tmp/upxtest.orig /tmp/upxtest /tmp/pb_check /tmp/pb_addr \
+	/tmp/stalehelper /tmp/exectest /tmp/pbmatch /tmp/pbpin.fifo
 make clean >/dev/null
-make
-gcc -O0 -Wall -o userland/c/capture userland/c/capture.c -pthread
-gcc -O0 -o userland/c/sigsegv.out userland/c/sigsegv.c
-gcc -O0 -o userland/c/simple userland/c/simple.c
-gcc -O0 -Wall -o userland/c/extra userland/c/extra.c
-gcc -static -no-pie -O0 -o /tmp/upxtest.orig userland/c/upxtest.c
-rm -f /tmp/upxtest
-upx -q -o /tmp/upxtest /tmp/upxtest.orig
-gcc -O0 -o /tmp/pb_check tools/x86/pb_check.c
-gcc -O0 -o /tmp/pb_addr tools/x86/pb_addr.c
+clean_rc=$?
+if [ "$clean_rc" -ne 0 ]; then
+	echo "prep failed ($clean_rc): make clean"
+	exit 1
+fi
+prep make
+prep gcc -O0 -Wall -o userland/c/capture userland/c/capture.c -pthread
+prep gcc -O0 -o userland/c/sigsegv.out userland/c/sigsegv.c
+prep gcc -O0 -o userland/c/simple userland/c/simple.c
+prep gcc -O0 -Wall -o userland/c/extra userland/c/extra.c
+prep gcc -static -no-pie -O0 -o /tmp/upxtest.orig userland/c/upxtest.c
+prep rm -f /tmp/upxtest
+prep upx -q -o /tmp/upxtest /tmp/upxtest.orig
+prep gcc -O0 -o /tmp/pb_check tools/x86/pb_check.c
+prep gcc -O0 -o /tmp/pb_addr tools/x86/pb_addr.c
 python3 tools/test_pb_rank.py
 mark $? pb_rank
 
@@ -105,7 +128,13 @@ say "sigsegv"
 unload
 clean_dumps
 load path=sigsegv
-sudo /tmp/pb_check 31c048bbd19d9691d08c97ff ./userland/c/sigsegv.out
+# Scope the search to the page the case is about. pb_check stops at the first
+# dump holding the needle and then kills its tracee, and the needle is a
+# compile-time constant in this program, so a snap of its .rodata page matches
+# too. Left unscoped the tracee dies before it reaches the instruction fault at
+# 0x100000000, the fault dump is never written, and the next check reads an
+# empty directory. The arm64 runner already scopes this the same way.
+sudo PB_WANT_ADDR=100000000 /tmp/pb_check 31c048bbd19d9691d08c97ff ./userland/c/sigsegv.out
 mark "$?" "sigsegv live"
 python3 - << 'PY'
 import glob
@@ -301,7 +330,7 @@ mark "$?" "maymove"
 say "execrace"
 unload
 clean_dumps
-cp -f userland/c/extra /tmp/stalehelper
+prep cp -f userland/c/extra /tmp/stalehelper
 load path=extra data=260000000-260001000
 ./userland/c/extra execrace
 if [ $? -eq 139 ]; then
@@ -472,7 +501,7 @@ mark "$?" "disarm"
 say "stale"
 unload
 clean_dumps
-cp -f userland/c/extra /tmp/stalehelper
+prep cp -f userland/c/extra /tmp/stalehelper
 load path=extra
 timeout 3 ./userland/c/extra stale
 if [ $? -eq 139 ]; then
@@ -484,7 +513,7 @@ fi
 say "execfail"
 unload
 clean_dumps
-cp -f userland/c/extra /tmp/exectest
+prep cp -f userland/c/extra /tmp/exectest
 load path=exectest
 /tmp/exectest fail
 mark "$?" "execfail"
@@ -492,8 +521,9 @@ mark "$?" "execfail"
 say "execve"
 unload
 clean_dumps
+sudo rm -rf /tmp/pbmatch
 mkdir -p /tmp/pbmatch
-cp -f userland/c/extra /tmp/pbmatch/notme
+prep cp -f userland/c/extra /tmp/pbmatch/notme
 load path=pbmatch
 ./userland/c/extra execve
 mark "$?" "execve"

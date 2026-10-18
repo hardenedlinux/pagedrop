@@ -128,44 +128,69 @@ A plain C program, packed with UPX and with the VMProtect demo, is compared in [
 Usage
 -----
 
-To test **pagedrop**, you can insert the LKM and try it with whatever binary you want. We provided you with [`sigsegv.c`](https://github.com/zTehRyaN/pagebuster/blob/main/sigsegv.c), a `.c` program that simply maps and executes a shellcode. Inside the `/userland/c/` directory you will also find `simple.c`, the one shown in the demo.
-
-So, just `insmod` the module and pass the name of the process as argument. Then, execute it.
+Load the module in a guest, not on a machine you care about. `path=` is a substring of the process name. `exact=1` matches it exactly.
 
 ```sh
-insmod pagedrop.ko path=sigsegv.out
-./sigsegv.out
+insmod pagedrop.ko path=wide.upx
+./wide.upx
 ```
 
-`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. The first read of an armed page from a tracked executable page is dumped, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump.
-
-The armed page is restored to its previous protection after that read and is not armed again, so each armed page is traced once for the life of the process rather than once per handler epoch. A later handler epoch that reads the same address is not seen. `munmap`, a replacing `mmap`, or an `mprotect` over the data page clears the record and the page is traced again.
+Dumps land in `/tmp`, one 4096-byte file per page, named `<va>_<epoch>`. `/tmp/pagedrop.index` records `tgid comm va epoch why`. A second run mixes with the first. Copy one run out before the next:
 
 ```sh
-python3 tools/pb_rank.py --file ./regress.vmp --tgid 1234
+python3 tools/pb_collect.py --out /tmp/cap --file ./wide.upx \
+    --lib /lib/x86_64-linux-gnu/libc.so.6 \
+    --lib /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
 ```
 
-That keeps one `tgid`. If several are present and `--tgid` is omitted, it lists them and exits 2. It drops a dump whose bytes match `libc`, `ld-linux`, `libstdc++`, or an executable `PT_LOAD` of `--file`. What remains is ranked with bytes missing from the on-disk file above bytes that are in it, `mprotect` and `fault` above `mmap`, and a later epoch above an earlier one. Pass other libraries with `--lib`.
+That copies the index and only the dump files it names. It does not glob `/tmp`. `--lib` is the guest's library, copied into the capture and listed in `libs.txt`. On arm64 those paths are under `/lib/aarch64-linux-gnu/`. Pass `--force` only to replace a capture that already has an index.
 
-Inside the `/tmp` directory, you will find all the timestamped dumps.
+`data=start-end` (hex) arms that range so a read from a tracked executable page dumps the data page and appends `ip data_va epoch` to `/tmp/pagedrop.trace`. The accepted cost is one fault per data page per handler version. A later version of the same handler page is traced again. `munmap`, a replacing `mmap`, or an `mprotect` over the data page clears the record.
+
+Rebuilding a loadable image
+---------------------------
+
+A directory of page files is not a program. A call that leaves the page has nowhere to land until both pages are one ELF at their runtime addresses. After the capture directory is on the machine where you will open Ghidra:
 
 ```sh
-ls /tmp
+python3 tools/pb_rank.py --capture /tmp/cap --out image.elf
 ```
 
-You should get an output similar to the following:
+`--file` is the packed file, and it is only the drop filter. Do not pass the unpacked original as `--file`. That drops the payload. `--capture` finds a packed file named `*.upx` or `packed`, and reads `libs.txt`. A copied library is not treated as the original. An unpacked file is picked up only when it is named `orig` or `*.orig`, or when you pass `--orig`.
 
-```
-100000000_494     7ffff7d4b000_291  7ffff7dc7000_415  7ffff7eb9000_30
-100001000_495     7ffff7d4c000_292  7ffff7dc8000_416  7ffff7eba000_31
-7ffff7cd1000_169  7ffff7d4d000_293  7ffff7dc9000_417  7ffff7ebb000_32
-7ffff7cd2000_170  7ffff7d4e000_294  7ffff7dca000_418  7ffff7ebc000_33
-7ffff7cd3000_171  7ffff7d4f000_295  7ffff7dcb000_419  7ffff7ebd000_34
-7ffff7cd4000_172  7ffff7d50000_296  7ffff7dcc000_420  7ffff7ebe000_35
-7ffff7cd5000_173  7ffff7d51000_297  7ffff7dcd000_421  7ffff7ebf000_36
-7ffff7cd6000_174  7ffff7d52000_298  7ffff7dce000_422  7ffff7ec0000_37
-...
-```
+No `--lib` and no `libs.txt` means a warning and no library filter. The host's libc is not used. It fails to match a guest dump, or matches the wrong pages.
+
+What that ELF is, without the unpacked file:
+
+- Kept pages sit at the virtual addresses in the filenames. Contiguous pages share a `PT_LOAD`. A missing address stays a hole. It is not filled with zeroes.
+- libc, the loader, and pages whose bytes match the packed file are dropped.
+- A second epoch of the same address is a new ELF only when the bytes changed and are not the packed file.
+- The printed page list is in address order. `mprotect` is not preferred over `mmap`. On arm64 the unpacked text arrived as `mmap`.
+- Function names and import names are absent. The entry is the lowest kept page, not `main`, unless `--orig` supplied one that still falls inside the image. The output says `names none`.
+- Format strings and the GOT are absent when they never became executable, unless the module's `snap` pass copied them. That pass runs when a mapping that is not a library becomes executable, up to three times per process, and records non-executable pages that are not the stack, the heap, or a library. The index why is `snap`. All-zero pages are not written. A mapping larger than 64 pages is skipped.
+- `.strings` lists printable runs that were already in a kept page. Ghidra will not type a string from that sidecar alone.
+
+`--orig` is optional, and only for a file you already have. It names the entry, symbols, and imports, and splices read-only pages no dump covered. It is not required, and it is not the drop filter.
+
+Stock UPX does not encrypt. The stub decompresses, then makes the restored pages executable. If `upx -d` succeeds and every kept executable page matches, the tool writes `image.unpacked` and tells you to open that file, not the stitch. The stitch is the route when `upx -d` fails and the stub still restored real instructions. A fully virtualized function never becomes executable, so it is not in the dump. Do not invent those bytes.
+
+Sidecars sit next to the ELF:
+
+| File | Contents |
+|---|---|
+| `.pages` | One line per page: `va epoch why` and whether it was kept, dropped as a library or as the packed file, or a gap nothing dumped |
+| `.libs` | Library base per path, with the page count that supports it; a base backed by fewer pages is marked `rejected` |
+| `.strings` | Printable runs with their runtime addresses |
+| `.missing` | Original code symbols no dump ever carried. Empty unless `--orig` was applied |
+| `.tails` | Pages that match the packed file for a while and then diverge |
+
+`--rebase` also writes `rebased.elf` at the original file addresses, which needs a slide from `--orig` or from packed-file pages that were dumped and dropped. `--drop-stray` leaves a partial packed-file match out of an executable segment. `--rank page` is the address order used when `--out` is set; without `--out` the default list still prefers bytes missing from the packed file, then `mprotect` and `fault` over `mmap`.
+
+`userland/c/wide.c` is the stitcher check: eight functions forced onto eight pages. Pack it with UPX and pass that guest's libc and loader. The stitch drops those library pages. Cross-page calls resolve. Names resolve only when `--orig` is passed. Without it, a decompiler does not discover the page-aligned functions from the entry; the body is there once the function is created at its runtime address. A `printf` in the image is a PLT stub, not libc. The string `libc.so.6` in the dynamic table is the import, not a leaked library page.
+
+The keep count is not a contract. One snap page is enough to move it. Last measured: x86 `6.8.0-106-generic`, UPX 4.2.2, 452 dumps, 13 kept; arm64 `6.6.62+rpt-rpi-v8`, UPX 5.0.2, 497 dumps, 12 kept. On both, Ghidra decompiled `mix` as `param_1 * 0x11 ^ 0x5a5a`, and `scramble` called `mix` and `weigh` on the other pages.
+
+The stitcher does not change the module. `python3 tools/test_pb_rank.py` is the host check. It does not load the module.
 
 Userland programs live in `userland/c/`:
 
@@ -175,148 +200,26 @@ Userland programs live in `userland/c/`:
 | `sigsegv.out` | Write-or-execute page, then the execute fault |
 | `capture` | Rename, child, `mremap`, `pkey_mprotect`, threads |
 | `upxtest` | Static binary for UPX. Pack it with `upx -o upxtest upxtest` after `make upxtest` |
+| `regress` | Small dynamic program used in `docs/orig-upx-vmp.md` |
+| `wide` | Eight page-aligned functions. Stitcher check, not a kernel-suite case |
+| `extra` | Built by the guest runners for the kernel suite |
+| `packdiff` | Marker bytes for a packed-versus-dump compare |
 
-`capture` exits 0 only if its markers were dumped. The full check, including a live physical-page compare, is `tools/x86/run_tests.sh`. It needs `upx` and a static libc, and it loads the module.
+`userland/c/decpage.c` and `userland/c/nzpack.c` are not UPX and are not built by the Makefile. Stock UPX compresses. `decpage.c` decrypts, then calls `mprotect`. `nzpack.c` run-length decodes, then calls `mprotect`. The page that becomes executable is not in the file, so `upx -d` is not the route. On both arches that page decompiled as `return 0x5a87`. That is not evidence about UPX.
+
+`capture` exits 0 only if its markers were dumped. The kernel suite is `tools/x86/run_tests.sh` and `tools/arm64/run_tests.sh`, each on its own guest. They load the module.
 
 ```sh
 cd userland/c && make
 sudo insmod ../../pagedrop.ko path=capture
 ./capture
+sudo rmmod pagedrop
 ```
 
-To remove the LKM, run:
+Older QEMU notes
+----------------
 
-```sh
-rmmod pagedrop.ko
-```
-
-Quickly test in QEMU
---------------------
-
-If you want to test it on a safe environment, you can use [Ciro Santilli's](https://github.com/cirosantilli/linux-kernel-module-cheat) emulation setup.
-
-This setup has been mostly tested on Ubuntu.
-Reserve 12 GB of disk and run:
-
-```sh
-git clone https://github.com/cirosantilli/linux-kernel-module-cheat
-cd linux-kernel-module-cheat
-git reset --hard 5ec6595e1f3afb6213ba7c14ab5e4e3893a4089f
-```
-
-Unlike Ubuntu 20.04 LTS, here `kprobes` is not enabled by default. So, you must enable it on linux kernel configs.
-
-```sh
-cd linux_config
-cat <<EOT >> default
-
-# Kprobes
-CONFIG_KPROBES=y
-EOT
-cd ..
-```
-
-Now, you can start the build:
-
-```sh
-# For Debian derivatives
-./build --download-dependencies qemu-buildroot
-# If you use another distro, you'll have to install the deps manually
-./build --no-apt --download-dependencies qemu-buildroot
-```
-
-The initial build will take a while (30 minutes to 2 hours) to clone and build.
-
-Finally, what you need to do is to insert inside the environment the kernel module as well as all the `c` programs you want to test it on.
-If you want to do it manually, you can build the module as shown before, the target programs and then just put them inside QEMU:
-
-```sh
-cd linux-kernel-module-cheat
-cp /path/to/files $PWD/out/buildroot/build/default/x86_64/target/lkmc/
-./build-buildroot
-```
-
-In this way, you will find them inside the directory where you spawn.
-
-You can now run QEMU:
-
-```sh
-./run
-```
-
-Use with `Ctrl-A X` to quit QEMU or type `poweroff`.
-
-If you use `linux-kernel-module-cheat` to build the module and the programs for you, you can put `pagedrop.c` inside `/kernel_modules`, and the `c` files inside `/userland/c`. Then run:
-
-```sh
-# Rebuild and run
-./build-userland
-./build-modules
-./run
-
-# Load kernel module
-cd /mnt/9p/out_rootfs_overlay/lkmc
-insmod pagedrop.ko path=sigsegv.out
-
-# Run the program
-./c/sigsegv.out
-
-# List dumped pages
-ls /tmp
-```
-
-If you want to test with other binaries, you may put the source `.c` file inside the [`/userland/c`](https://github.com/cirosantilli/linux-kernel-module-cheat/tree/master/userland/c) folder and let the simulator compile it for you by running `./build-userland`. Now, after running the system, you will find it compiled inside `/mnt/9p/out_rootfs_overlay/lkmc/c/`.
-
-UPX testing
------------
-
-If you want to try how **pagedrop** behaves with UPX-packed binaries, you should prepare them outside the QEMU guest environment, and then inject into it.
-First of all, install [upx](https://upx.github.io/). On Ubuntu 20.04 LTS, run:
-
-```sh
-sudo apt-get update -y
-sudo apt-get install -y upx-ucl
-```
-
-Then, for instance, grab a `.c` program and compile it. Make sure it reaches the minimum size required by upx to pack it: UPX cannot handle binaries under 40Kb. The best way to work-around this problem is to compile your binary in static mode, in order to get a bigger executable file.
-So, just try:
-
-```sh
-gcc -static -o mytest mytest.c
-upx -o mytest_packed mytest
-```
-
-The easiest way to put it inside QEMU is the following.
-
-```c
-cd linux-kernel-module-cheat
-cp /path/to/mytest_packed $PWD/out/buildroot/build/default/x86_64/target/lkmc/
-./build-buildroot
-```
-
-Now you can test it, in the usual way:
-
-```sh
-./run
-insmod /mnt/9p/out_rootfs_overlay/lkmc/pagedrop.ko path=mytest_packed
-./mytest_packed
-ls /tmp
-```
-
-Output will be something like that:
-
-```
-401000_2        427000_40       44d000_78       473000_116
-402000_3        428000_41       44e000_79       474000_117
-403000_4        429000_42       44f000_80       475000_118
-404000_5        42a000_43       450000_81       476000_119
-405000_6        42b000_44       451000_82       477000_120
-406000_7        42c000_45       452000_83       478000_121
-407000_8        42d000_46       453000_84       479000_122
-408000_9        42e000_47       454000_85       47a000_123
-409000_10       42f000_48       455000_86       47b000_124
-40a000_11       430000_49       456000_87       47c000_125
-```
+`linux-kernel-module-cheat` was an early way to boot a kernel and load the module. It is not how this tree is tested. Build the module on the guest, against that guest's headers. The measured guests are Ubuntu 24.04, kernel 6.8.0-101-generic, and a Raspberry Pi 4, kernel 6.6.62+rpt-rpi-v8.
 
 Licensing
 ---------

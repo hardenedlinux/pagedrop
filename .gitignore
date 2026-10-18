@@ -12,6 +12,8 @@ userland/c/upxtest
 userland/c/upxtest.orig
 userland/c/extra
 userland/c/regress
+userland/c/wide
+__pycache__/
 *.orig
 *.upx
 *.vmp

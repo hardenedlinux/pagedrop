@@ -83,7 +83,18 @@ static int check_dump(pid_t pid, const unsigned char *needle, size_t nlen)
 		found = (n == (ssize_t)cmp && memcmp(live, needle, cmp) == 0 &&
 			 ((ent >> 63) & 1));
 		free(buf);
-		break;
+		/*
+		 * Keep looking unless this candidate verified. The live check is
+		 * time-varying: a page dumped at one epoch and then written,
+		 * unmapped or swapped out before the stop that inspects it no
+		 * longer matches, and readdir order over a flat /tmp decides
+		 * which candidate is seen first. Breaking unconditionally turns
+		 * that into a false negative, and the caller cannot tell it from
+		 * a module that never captured the page at all. Continuing can
+		 * only turn a fail into a pass, never the reverse.
+		 */
+		if (found)
+			break;
 	}
 	closedir(d);
 	return found;

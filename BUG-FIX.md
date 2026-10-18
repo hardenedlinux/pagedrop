@@ -91,6 +91,30 @@ The index above is generated from those labels by
 `drop-loop/tools/bugtable.py`; run it after changing any heading. Editing the
 table by hand is what makes it wrong.
 
+**Status of the model tree, after it was lost and rebuilt.** This file cites
+nine `drop-loop/models/...` directories. One of them, `lock-order`, survived.
+The other eight — `epoch-rearm`, `fault-signal`, `mprotect-arm-order`,
+`mprotect-arm-window`, `mprotect-subset`, `mremap-efault`, `module-pin`,
+`restore-uniformity` — were rebuilt from the prose in this file, and each rebuilt
+`MC.tla` says so in its banner. **A reconstruction reproduces the verdict, not
+the original reasoning, and it is not evidence about a kernel.** Where a
+reconstruction disagrees with what this file says, the disagreement is recorded
+at the citation rather than resolved in favour of either; search this file for
+`Reconstruction note`.
+
+That loss is also why the `ALL MODELS OK (N checks)` figures quoted in the
+entries below — 26, 28, 33, 40, 50 and 55 — do not reconcile with each other
+against the tree as it stands. Fourteen models and 19 registered configs
+survived; the counts of 26 and above belong to a tree with roughly seven more
+registered checks whose origin no surviving artifact records. The rebuilt tree
+registers 55 and prints `ALL MODELS OK (55 checks)`, which matches the cycle-9
+figure, but the intermediate counts cannot be reproduced and should not be
+treated as a sequence you can re-derive by adding models. Six cited run logs and
+four cited repro programs are gone for good and are listed in
+`drop-loop/runs/LOST.md`; `drop-loop/tools/check_refs.py` fails on any citation
+that is missing and not listed there, which is how the rest of the drift in this
+file would be caught.
+
 The archived cycle-6 archive read: **21 fixed, 5 left unfixed, 3 not defects.** As of the cycle-5 archive the same three commands printed 20, 3 and 2; as of the cycle-3 archive, 19, 2 and 2; before the cycle-3 work, 18, 1 and 2.
 
 That archived line and the headings disagreed by exactly one entry, and the entry was the read path. The cycle-6 archivist recorded the read path's open half as a declared limit in prose while its heading stayed `## Fix:`, so the mechanical tally read **22 fixed, 4 left unfixed, 3 not defects** and counted a still-refusing path as fixed. Cycle 7's first archivist pass moved that half into its own `## Left unfixed:` entry and added the destination half's status line; no defect changed status and nothing was added to the fixed count by that pass. The generated tally then read 22, 5 and 3 for 30 entries.
@@ -341,7 +365,7 @@ readmove single=0: ret=ffffffffffffffff errno=14 (Bad address)
 
 Isolated with the module **unloaded**, to show it is the kernel rule and not the module: a source split into `PROT_READ` then `PROT_READ|PROT_WRITE` gives `errno=14`; a uniform 3-page `PROT_NONE` source, a uniform 2-page read-only source and a uniform 2-page `PROT_NONE` source all give `ret=280000000`. Uniformity is what `mremap` needs, not a single VMA.
 
-Fixed by restoring a **run** rather than a page. `pb_armed_run` computes the maximal run of armed pages around the faulting page that all record the same protection, and `pb_handle_data` restores that whole run in one `mprotect`. The run stops at the first page with no record or a different one, so it never restores a page the module has no record for. The design was not chosen by the implementer: the local model `drop-loop/models/restore-uniformity` had already enumerated the candidate restore shapes, and only `run-uniform` and `keep-differing` hold, while the shipped per-page shape violates. `run-uniform` is the one implemented.
+Fixed by restoring a **run** rather than a page. `pb_armed_run` computes the maximal run of armed pages around the faulting page that all record the same protection, and `pb_handle_data` restores that whole run in one `mprotect`. The run stops at the first page with no record or a different one, so it never restores a page the module has no record for. The design was not chosen by the implementer: the local model `drop-loop/models/restore-uniformity` had already enumerated the candidate restore shapes, and only `run-uniform` and `keep-differing` hold, while the shipped per-page shape violates. `run-uniform` is the one implemented. **Reconstruction note, added after the tree was lost:** the rebuilt model reproduces all six documented verdicts, and it says the shipped per-page shape violates `Faithful`, which this entry does not name. Its counterexample is `faulted = 2`, `touched = {2}` while `Run(2) = {2, 3, 4}` — the split the fix removed. One caveat on reading this entry against the model: the property wording this entry implies for `Safe` and `Faithful` is ambiguous, and only one reading makes all six cited verdicts fall out at once — `Faithful` is "the run comes back whole and nothing without a record is touched", `Safe` is "the faulting page is accessible and every armed page touched carries the protection *its own* record names". A literal reading of "Faithful never restores a differing page" is violated by construction by `keep-differing`, which this entry says holds.
 
 After the fix, on the same repro, matching the module-unloaded control:
 
@@ -586,7 +610,7 @@ Runs 2 and 3 each direction: `BEFORE ... result=dest-after mincore 280000000 rc=
 
 Void runs, reported not hidden: four suite runs across the two roles' sessions had `mremaprace` segfault the target (`extra[6929]: segfault at 260000000 ... error 4`, `extra[25844]: segfault at 260000000 ... error 4`), which left the module pinned and every later case printed `insmod: ERROR: ... File exists`; one needed a reboot of the disposable guest. Not counted for anything, per the known 9-in-30 rate in its own entry below.
 
-**Model.** `drop-loop/models/mprotect-subset`, 10 configs, all registered; `bash drop-loop/tools/check_models.sh` → `ALL MODELS OK (50 checks)`. `shipped.cfg` (the pre-cycle-7 order) violates `Safe` at `KernelMove` and `ReturnedUniform` at `KernelMp`, with the trace state showing exactly the split above: `prot = <<"rw", "none", "none">>` with `rec = {2, 3}` in state `phase = "returned"`. `fixed.cfg` holds `Safe`, `ReturnedUniform`, `FailedCallKeepsArm`, `ArmedInaccessible` and `RecordFresh`. `wide.cfg` holds, which is the control: the defect was specific to the strictness. All four `hold` configs were shown non-vacuous by substituting `NeverMoved` and getting a violation trace. `drop-loop/claim.md` cited `pagedrop.c:808` for the one-page `pb_mprotect` in `pb_disarm_range` and had it at 807 in the pre-fix tree; that function no longer exists, so the citation is dead either way.
+**Model.** `drop-loop/models/mprotect-subset`, 10 configs, all registered; `bash drop-loop/tools/check_models.sh` → `ALL MODELS OK (50 checks)`. `shipped.cfg` (the pre-cycle-7 order) violates `Safe` at `KernelMove` and `ReturnedUniform` at `KernelMp`, with the trace state showing exactly the split above: `prot = <<"rw", "none", "none">>` with `rec = {2, 3}` in state `phase = "returned"`. `fixed.cfg` holds `Safe`, `ReturnedUniform`, `FailedCallKeepsArm`, `ArmedInaccessible` and `RecordFresh`. `wide.cfg` holds, which is the control: the defect was specific to the strictness. All four `hold` configs were shown non-vacuous by substituting `NeverMoved` and getting a violation trace. **Reconstruction note, added after the tree was lost:** `models/mprotect-subset` was rebuilt from this prose, and the `NeverMoved` substitution does *not* produce a violation trace — it only removes the action that can set the flag, so a config whose run is genuinely uniform cannot fail on a single flip of it. The rebuilt model establishes non-vacuity two other ways instead: a reachability witness (`-dump dot`, showing `KernelMove` taken and `lost` still FALSE in every hold config), and one substitution per config that does collapse it to a violation trace (`fixed.cfg` with `SettleAfter = FALSE`, `wide.cfg` and `submix-wide.cfg` with `Subset = TRUE`, `failafter-clean.cfg` with `KernelPartial = TRUE`). Treat the original `NeverMoved` sentence as not reproducible rather than as a method to reuse. `drop-loop/claim.md` cited `pagedrop.c:808` for the one-page `pb_mprotect` in `pb_disarm_range` and had it at 807 in the pre-fix tree; that function no longer exists, so the citation is dead either way.
 
 **Not claimed by this entry.** The window between `real_sys_mprotect` returning and `pb_armed_rearm` finishing, in which a read of a named page sees the kernel's protection and does not fault, is the arming window already registered as violating in `drop-loop/models/mprotect-arm-window`, and this change **widens** it: `pb_try_arm` already ran post-syscall for exec and wx protections, and now every successful `mprotect` ends in an arm, so the window applies to non-exec protections too. See the two window entries below. Nothing here says the window holds.
 
